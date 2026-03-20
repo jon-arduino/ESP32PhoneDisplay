@@ -1,0 +1,47 @@
+#pragma once
+
+#include <Arduino.h>
+
+// -----------------------------------------------------------------------------
+//  GraphicsTransport — abstract base class for all display transports
+//
+//  Implement this to use any wireless or wired channel with ESP32PhoneDisplay.
+//  The library ships with BleTransport and WiFiTransport. For custom channels
+//  (LoRa, serial, USB CDC, etc.) subclass this and pass it to ESP32PhoneDisplay.
+//
+//  Threading:
+//    send() may be called from loop() or any FreeRTOS task. Implementations
+//    must be thread-safe if the underlying channel requires it.
+//
+//  Usage:
+//    class MyTransport : public GraphicsTransport {
+//    public:
+//        void  send(const uint8_t* data, uint16_t len) override { ... }
+//        bool  canSend() const override { return connected; }
+//    };
+// -----------------------------------------------------------------------------
+class GraphicsTransport
+{
+public:
+    virtual ~GraphicsTransport() = default;
+
+    // Send raw bytes. Called for every encoded GFX command.
+    // Implementations should buffer internally if needed — callers assume
+    // send() returns quickly and do not retry on failure.
+    virtual void send(const uint8_t *data, uint16_t len) = 0;
+
+    // Returns true when the transport is ready to accept data.
+    // ESP32PhoneDisplay checks this before sending — if false, commands
+    // are silently dropped. Implementations should return false when
+    // not connected, before first client connection, etc.
+    virtual bool canSend() const = 0;
+
+    // Optional: flush any internally buffered data.
+    // Called at explicit frame boundaries (ESP32PhoneDisplay::flush()).
+    // No-op by default — only needed if your implementation buffers.
+    virtual void flush() {}
+
+    // Optional: discard any buffered bytes without sending.
+    // Called on reconnect to clear stale data.
+    virtual void reset() {}
+};
