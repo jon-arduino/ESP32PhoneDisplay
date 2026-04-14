@@ -1,98 +1,130 @@
 #pragma once
 #include <Arduino.h>
+#include "../GraphicsTransport.h"
+#include "../GraphicsProtocol.h"
 #include "../Protocol.h"
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  iPhoneTouchScreen — drop-in replacement for Adafruit_TouchScreen
+// -----------------------------------------------------------------------------
+//  RemoteTouchScreen — drop-in replacement for Adafruit_TouchScreen and
+//                      Adafruit_FT6206 (capacitive single-touch)
 //
-//  Allows any Arduino/ESP32 sketch written for a resistive touchscreen to run
-//  with the iPhone as the display AND touch input, with zero changes to the
-//  sketch's touch-handling code.
+//  Emulates a physical touchscreen using iPhone touch input sent over the
+//  existing BLE or WiFi back-channel. No extra wiring, no ADC pins needed.
 //
-//  Adafruit pattern (unchanged in ported sketch):
+//  Adafruit_TouchScreen (resistive) pattern — works unchanged:
 //
 //    TSPoint p = ts.getPoint();
-//    if (p.z > MINPRESSURE) {
+//    if (p.z > RemoteTouchScreen::MINPRESSURE) {
 //        btn.press(btn.contains(p.x, p.y));
 //    } else {
 //        btn.press(false);
 //    }
-//    if (btn.justPressed())  { ... }
-//    if (btn.justReleased()) { ... }
 //
-//  Usage:
-//    iPhoneTouchScreen ts;
+//  Adafruit_FT6206 (capacitive) pattern — works unchanged:
 //
-//    // Register with whichever manager is active:
-//    bleManager.onTouch([](uint8_t cmd, int16_t x, int16_t y) {
-//        ts.handleTouch(cmd, x, y);
-//    });
-//    wifiManager.onTouch([](uint8_t cmd, int16_t x, int16_t y) {
-//        ts.handleTouch(cmd, x, y);
-//    });
+//    if (ts.touched()) {
+//        TSPoint p = ts.getPoint();
+//        tft.drawPixel(p.x, p.y, WHITE);
+//    }
 //
-//    // In loop() — unchanged from original sketch:
-//    TSPoint p = ts.getPoint();
+//  Key differences from physical touchscreens:
+//    - Coordinates are pre-mapped to virtual display pixels. No map() or
+//      calibration constants needed. Remove them when porting.
+//    - z is always BC_TOUCH_Z_CONTACT (128) when touching, 0 when not.
+//      This exceeds any MINPRESSURE threshold used in Adafruit sketches.
+//    - begin() sends TOUCH_BEGIN to the iPhone and wires callbacks
+//      automatically. No manual callback registration needed.
 //
 //  Thread safety:
-//    handleTouch() is called from the AsyncTCP or NimBLE task.
-//    getPoint() is called from loop(). The _point fields are written
-//    atomically (each is a single aligned word on ESP32), so no mutex
-//    is needed for the common single-touch use case.
+//    handleTouch() is called from the BLE or WiFi receive task.
+//    getPoint() / touched() are called from loop().
+//    The _point struct is written atomically on ESP32 (aligned 16-bit
+//    fields) so no mutex is needed for single-touch use.
 //
-//  Coordinate space:
-//    iPhone sends coordinates already mapped to virtual display space
-//    (0,0)–(displayWidth-1, displayHeight-1). No remapping needed on
-//    the ESP32 side — p.x and p.y are ready to pass to btn.contains().
+//  Usage:
+//    RemoteTouchScreen ts(transport);   // same transport as display
 //
-//  Pressure (z):
-//    Capacitive screens have no real pressure. We use BC_TOUCH_PRESSURE
-//    (0xFF) on DOWN/MOVE and 0 on UP. This is always > any MINPRESSURE
-//    threshold used in Adafruit example sketches (typically 10–100).
-// ─────────────────────────────────────────────────────────────────────────────
+//    void setup() {
+//        transport.begin();
+//        display.begin(240, 320);
+//        ts.begin();                    // sends TOUCH_BEGIN, wires callbacks
+//    }
+//
+//    void loop() {
+//        TSPoint p = ts.getPoint();
+//        if (p.z > RemoteTouchScreen::MINPRESSURE) {
+//            // finger at p.x, p.y
+//        }
+//    }
+// -----------------------------------------------------------------------------
 
-// Mirrors Adafruit_TouchScreen's TSPoint — compatible with btn.contains(p.x, p.y)
+// TSPoint — mirrors Adafruit_TouchScreen's TSPoint struct.
+// Compatible with btn.contains(p.x, p.y) and all Adafruit GFX button code.
 struct TSPoint {
     int16_t x = 0;
     int16_t y = 0;
-    int16_t z = 0;   // 0 = no touch, >0 = touching (BC_TOUCH_PRESSURE = 0xFF)
+    int16_t z = 0;  // BC_TOUCH_Z_CONTACT (128) when touching, 0 when not
+
+    TSPoint() = default;
+    TSPoint(int16_t x_, int16_t y_, int16_t z_) : x(x_), y(y_), z(z_) {}
 };
 
-class iPhoneTouchScreen
+class RemoteTouchScreen
 {
 public:
-    iPhoneTouchScreen() = default;
+    // Construct with the same transport used for the display.
+    explicit RemoteTouchScreen(GraphicsTransport &transport);
 
-    // ── Called from loop() — returns current touch state ─────────────────────
-    // Returns a copy of the last received touch point.
-    // z > 0 means finger is down; z == 0 means no touch.
+    // ── Setup ─────────────────────────────────────────────────────────────────
+
+    // Start touch reporting. Sends TOUCH_BEGIN to the iPhone and registers
+    // the back-channel callback on the transport automatically.
+    //
+    // mode:         touch emulation mode (default TOUCH_MODE_RESISTIVE)
+    // interval_ms:  TOUCH_MOVE throttle in ms (default 50ms = 20Hz)
+    //               0 = every event, 16 = ~60Hz, 100 = 10Hz
+    void begin(uint8_t  mode        = TOUCH_MODE_RESISTIVE,
+               uint16_t interval_ms = TOUCH_MOVE_INTERVAL_MS_DEFAULT);
+
+    // Stop touch reporting. Sends TOUCH_END to the iPhone.
+    void end();
+
+    // Update the TOUCH_MOVE throttle interval while touch is active.
+    // Sends TOUCH_DELAY to the iPhone immediately.
+    void setDelay(uint16_t interval_ms);
+
+    // ── Polling API (call from loop()) ────────────────────────────────────────
+
+    // Returns the most recent touch point.
     // Compatible with Adafruit_TouchScreen::getPoint().
-    TSPoint getPoint() const { return _point; }
+    // z > MINPRESSURE means finger is down.
+    TSPoint getPoint() const;
 
-    // ── Called from back-channel callback (BLE or WiFi task) ─────────────────
-    // Decodes the back-channel touch event and updates _point.
-    // cmd: BC_CMD_TOUCH_DOWN, BC_CMD_TOUCH_MOVE, or BC_CMD_TOUCH_UP
-    // x,y: virtual display coordinates (only meaningful for DOWN/MOVE)
-    void handleTouch(uint8_t cmd, int16_t x, int16_t y)
-    {
-        switch (cmd) {
-            case BC_CMD_TOUCH_DOWN:
-            case BC_CMD_TOUCH_MOVE:
-                _point = { x, y, (int16_t)BC_TOUCH_PRESSURE };
-                break;
-            case BC_CMD_TOUCH_UP:
-                _point = { 0, 0, 0 };
-                break;
-            default:
-                break;
-        }
-    }
+    // Returns true if a finger is currently down.
+    // Compatible with Adafruit_FT6206::touched().
+    bool touched() const;
 
-    // ── Convenience: minimum pressure threshold ───────────────────────────────
-    // Use instead of a magic number in ported sketches:
-    //   if (p.z > iPhoneTouchScreen::MINPRESSURE) { ... }
+    // ── Internal — called by back-channel callback ────────────────────────────
+    // Not for direct use in sketches — public so the lambda can access it.
+    void handleTouch(uint8_t cmd, int16_t x, int16_t y, uint8_t z);
+
+    // ── Constants ─────────────────────────────────────────────────────────────
+
+    // Minimum z value to consider a touch valid.
+    // Use in place of a magic number:
+    //   if (p.z > RemoteTouchScreen::MINPRESSURE) { ... }
+    // BC_TOUCH_Z_CONTACT (128) always exceeds this threshold.
     static constexpr int16_t MINPRESSURE = 1;
 
+    // pressureThreshhold — matches Adafruit_TouchScreen public member name
+    // so sketches using ts.pressureThreshhold compile without change.
+    int16_t pressureThreshhold = MINPRESSURE;
+
 private:
-    volatile TSPoint _point;  // updated by back-channel task, read by loop()
+    GraphicsTransport &_transport;
+    volatile TSPoint   _point;        // updated by back-channel task
+    bool               _active = false;
+
+    // Send a framed GFX command with payload
+    void sendCommand(uint8_t cmd, const void *payload, uint16_t payloadLen);
 };

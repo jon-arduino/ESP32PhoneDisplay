@@ -38,3 +38,20 @@ static constexpr uint8_t BC_CMD_TOUCH_UP   = 0x12;
 static constexpr uint8_t BC_TOUCH_PRESSURE    = 0xFF;
 static constexpr uint8_t BC_TOUCH_PAYLOAD_LEN = 5;    // x(2)+y(2)+z(1)
 static constexpr uint8_t BC_NO_PAYLOAD_LEN    = 0;
+
+// Touch mode values — used in GfxTouchBeginPayload.mode
+static constexpr uint8_t TOUCH_MODE_RESISTIVE      = 0x00; // Adafruit_TouchScreen emulation
+static constexpr uint8_t TOUCH_MODE_CAP_SINGLE     = 0x01; // capacitive single (future)
+static constexpr uint8_t TOUCH_MODE_CAP_MULTI      = 0x02; // capacitive multi  (future)
+
+// z value reported by iPhone for touch contact.
+// iPhone capacitive screens have no real pressure — we use a fixed mid-scale
+// value (128) so it is always above any MINPRESSURE threshold used in
+// Adafruit_TouchScreen sketches (typically 10-100).
+static constexpr uint8_t BC_TOUCH_Z_CONTACT = 128;
+static constexpr uint8_t BC_TOUCH_Z_NONE    = 0;
+
+// Default move throttle — 50ms (20Hz). Good balance for UI interaction vs
+// BLE/WiFi bandwidth. Adjust with RemoteTouchScreen::setDelay() or
+// GFX_CMD_TOUCH_DELAY if your sketch needs faster or slower updates.
+static constexpr uint16_t TOUCH_MOVE_INTERVAL_MS_DEFAULT = 50;

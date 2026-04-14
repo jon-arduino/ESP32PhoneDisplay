@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <functional>
 
 // -----------------------------------------------------------------------------
 //  GraphicsTransport — abstract base class for all display transports
@@ -44,4 +45,17 @@ public:
     // Optional: discard any buffered bytes without sending.
     // Called on reconnect to clear stale data.
     virtual void reset() {}
+
+    // Optional: register a callback for touch events from the iPhone.
+    // cmd: BC_CMD_TOUCH_DOWN (0x10), TOUCH_MOVE (0x11), or TOUCH_UP (0x12)
+    // x, y: virtual display coordinates (little-endian, pre-mapped to pixels)
+    // z: BC_TOUCH_Z_CONTACT (128) on DOWN/MOVE, BC_TOUCH_Z_NONE (0) on UP
+    //
+    // Called from the BLE or WiFi receive task — not from loop().
+    // Default implementation is a no-op for transports that don't support
+    // back-channel touch. RemoteTouchScreen calls this in begin().
+    virtual void onTouch(std::function<void(uint8_t cmd,
+                                            int16_t x,
+                                            int16_t y,
+                                            uint8_t z)> cb) {}
 };

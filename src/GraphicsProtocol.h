@@ -58,6 +58,13 @@ enum GfxCommand : uint8_t
     // Optional / future
     GFX_CMD_GET_TEXT_BOUNDS   = 0x60,
 
+    // Touch control (ESP32 → iPhone)
+    // Tell the iPhone to start/stop/configure sending touch events.
+    // See RemoteTouchScreen.h for the full touch API.
+    GFX_CMD_TOUCH_BEGIN       = 0x70,  // start touch reporting
+    GFX_CMD_TOUCH_END         = 0x71,  // stop touch reporting
+    GFX_CMD_TOUCH_DELAY       = 0x72,  // update move throttle interval
+
     // Transport (0xF0-0xFF — see Protocol.h)
     GFX_CMD_PING              = 0xF0,
 };
@@ -106,6 +113,29 @@ struct GFX_PACKED GfxCp437Payload          { uint8_t enable; };
 struct GFX_PACKED GfxSetFontPayload        { uint16_t fontId; };
 struct GFX_PACKED GfxWriteCharPayload      { uint8_t c; };
 struct GFX_PACKED GfxGetTextBoundsPayload  { int16_t x; int16_t y; /* text bytes follow */ };
+
+// ── Touch control payloads ────────────────────────────────────────────────────
+
+// TOUCH_BEGIN payload.
+// mode:
+//   0x00 = single touch — emulates Adafruit_TouchScreen (resistive) and
+//          Adafruit_FT6206 / Adafruit_CST816 (capacitive single-touch).
+//          Sketch code using getPoint() + p.z > MINPRESSURE works unchanged.
+//   0x01 = single touch + gestures (swipe, double-tap, long-press) -- future
+//   0x02 = multi-touch, up to 5 points, different API -- future
+// move_interval_ms: throttle between TOUCH_MOVE events (uint16 LE).
+//   0 = every event, 50 = 50ms (20Hz default), 100 = 10Hz.
+struct GFX_PACKED GfxTouchBeginPayload {
+    uint8_t  mode;               // touch mode (see above)
+    uint16_t move_interval_ms;   // TOUCH_MOVE throttle in ms (little-endian)
+};
+
+// TOUCH_END — no payload, send as zero-byte payload frame
+
+// TOUCH_DELAY payload — update move throttle while touch is active
+struct GFX_PACKED GfxTouchDelayPayload {
+    uint16_t move_interval_ms;   // new throttle in ms (little-endian)
+};
 
 #if !defined(__GNUC__)
 #  pragma pack(pop)

@@ -1,4 +1,5 @@
 #include "BackChannelParser.h"
+#include "Protocol.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  feed — accumulate bytes and dispatch complete frames
@@ -71,23 +72,16 @@ void BackChannelParser::dispatch(uint8_t cmd, const uint8_t *payload, size_t pay
         case BC_CMD_TOUCH_DOWN:
         case BC_CMD_TOUCH_MOVE: {
             if (payload && payloadLen >= BC_TOUCH_PAYLOAD_LEN) {
-                int16_t x = (int16_t)((payload[0] << 8) | payload[1]);
-                int16_t y = (int16_t)((payload[2] << 8) | payload[3]);
-                // payload[4] is z — available if needed, ignored for now
-                Serial.printf("[BackChannel] TOUCH %s x=%d y=%d\n",
-                              cmd == BC_CMD_TOUCH_DOWN ? "DOWN" : "MOVE", x, y);
-                if (_touchCallback) _touchCallback(cmd, x, y);
-            } else {
-                Serial.printf("[BackChannel] TOUCH %s — short payload (%d bytes)\n",
-                              cmd == BC_CMD_TOUCH_DOWN ? "DOWN" : "MOVE",
-                              (int)payloadLen);
+                int16_t x = (int16_t)((payload[1] << 8) | payload[0]);  // little-endian
+                int16_t y = (int16_t)((payload[3] << 8) | payload[2]);  // little-endian
+                uint8_t z = payload[4];  // BC_TOUCH_Z_CONTACT (128) from iPhone
+                if (_touchCallback) _touchCallback(cmd, x, y, z);
             }
             break;
         }
 
         case BC_CMD_TOUCH_UP:
-            Serial.println("[BackChannel] TOUCH UP");
-            if (_touchCallback) _touchCallback(cmd, 0, 0);
+            if (_touchCallback) _touchCallback(BC_CMD_TOUCH_UP, 0, 0, BC_TOUCH_Z_NONE);
             break;
 
         default:

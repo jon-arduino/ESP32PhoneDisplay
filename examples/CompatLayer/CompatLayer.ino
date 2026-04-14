@@ -22,6 +22,13 @@
 #include <ESP32PhoneDisplay_Compat.h>
 #include <transport/BleTransport.h>
 
+// Forward declarations — required for C++ (Arduino IDE adds these automatically)
+void testFillScreen();
+void testText();
+void testLines(uint16_t color);
+void testRects(uint16_t color);
+void testCircles(uint8_t radius, uint16_t color);
+
 BleTransport              transport;
 ESP32PhoneDisplay_Compat  tft(transport);   // 240x320 default
 
@@ -113,3 +120,4 @@ void testCircles(uint8_t radius, uint16_t color)
         for (int16_t y = radius; y < tft.height(); y += radius * 2)
             tft.drawCircle(x, y, radius, color);
 }
+

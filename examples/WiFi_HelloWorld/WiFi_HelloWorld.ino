@@ -5,16 +5,18 @@
 // 3. Open the ESP32PhoneDisplay iPhone app
 // 4. Tap "Wi-Fi" — the ESP32 appears as "esp32-display"
 // 5. Connect and the display will show the hello world screen
+//
+// No calls needed in loop() — the transport manages heartbeat and
+// auto-flush automatically via a background FreeRTOS task.
 
 #include <ESP32PhoneDisplay.h>
 #include <transport/WiFiTransport.h>
 
 // ── Configure your network ────────────────────────────────────────────────────
-#define WIFI_SSID     "YourNetworkName"
-#define WIFI_PASSWORD "YourPassword"
+#define WIFI_SSID     "lotz_net1"
+#define WIFI_PASSWORD "thelotznetwork1"
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Colour helpers (RGB565)
 #define BLACK   0x0000
 #define WHITE   0xFFFF
 #define RED     0xF800
@@ -22,22 +24,29 @@
 #define BLUE    0x001F
 #define YELLOW  0xFFE0
 
-WiFiTransport       transport(WIFI_SSID, WIFI_PASSWORD, "esp32-display");
-ESP32PhoneDisplay   display(transport);
+WiFiTransport     transport(WIFI_SSID, WIFI_PASSWORD, "esp32-display");
+ESP32PhoneDisplay display(transport);
+bool              displayReady = false;
 
 void setup()
 {
     Serial.begin(115200);
+    delay(2000);
+    Serial.println("BOOT");
 
     // Optional: fall back to ESP32-hosted network if home WiFi unavailable
-    // (useful for demos away from home — join "ESP32-Display" on iPhone)
     transport.setSoftAP("ESP32-Display", "display123");
 
-    transport.begin();       // connects to WiFi (or starts SoftAP on timeout)
+    transport.onConnected([]() {
+        displayReady = false;   // reinit display on reconnect
+    });
 
+    transport.begin();
     Serial.println("Waiting for iPhone...");
-    while (!transport.canSend()) { delay(100); }
+}
 
+void drawScreen()
+{
     display.begin(240, 320);
     display.clear(BLACK);
 
@@ -56,10 +65,18 @@ void setup()
     display.fillCircle(120, 230, 60, RED);
 
     display.flush();
-    Serial.println("Display initialised.");
 }
 
 void loop()
 {
-    delay(1000);
+    if (!transport.canSend()) {
+        Serial.println("Waiting for iPhone...");
+        delay(2000);
+        return;
+    }
+
+    if (transport.canSend() && !displayReady) {
+        drawScreen();
+        displayReady = true;
+    }
 }

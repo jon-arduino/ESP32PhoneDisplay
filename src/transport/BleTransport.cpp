@@ -8,7 +8,7 @@ extern "C" int os_msys_num_free(void);
 //  NimBLE server callbacks
 // ─────────────────────────────────────────────────────────────────────────────
 
-void BLEManager::ServerCB::onConnect(NimBLEServer*, NimBLEConnInfo& connInfo)
+void BleTransport::ServerCB::onConnect(NimBLEServer*, NimBLEConnInfo& connInfo)
 {
     _owner->_connected        = true;
     _owner->_notifySubscribed = false;
@@ -18,7 +18,7 @@ void BLEManager::ServerCB::onConnect(NimBLEServer*, NimBLEConnInfo& connInfo)
     Serial.println(connInfo.getAddress().toString().c_str());
 }
 
-void BLEManager::ServerCB::onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason)
+void BleTransport::ServerCB::onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason)
 {
     _owner->_connected        = false;
     _owner->_notifySubscribed = false;
@@ -36,7 +36,7 @@ void BLEManager::ServerCB::onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reas
     _owner->startAdvertising();
 }
 
-void BLEManager::ServerCB::onMTUChange(uint16_t mtu, NimBLEConnInfo&)
+void BleTransport::ServerCB::onMTUChange(uint16_t mtu, NimBLEConnInfo&)
 {
     _owner->_mtu = mtu;
     Serial.printf("[BLE] MTU=%d\n", mtu);
@@ -46,7 +46,7 @@ void BLEManager::ServerCB::onMTUChange(uint16_t mtu, NimBLEConnInfo&)
 //  TX characteristic callbacks
 // ─────────────────────────────────────────────────────────────────────────────
 
-void BLEManager::TxCharCB::onSubscribe(NimBLECharacteristic*,
+void BleTransport::TxCharCB::onSubscribe(NimBLECharacteristic*,
                                         NimBLEConnInfo&,
                                         uint16_t subValue)
 {
@@ -69,7 +69,7 @@ void BLEManager::TxCharCB::onSubscribe(NimBLECharacteristic*,
 
 // Called by NimBLE stack when notification is queued to the controller.
 // Gives the semaphore so the drain task can send the next chunk.
-void BLEManager::TxCharCB::onStatus(NimBLECharacteristic*, int code)
+void BleTransport::TxCharCB::onStatus(NimBLECharacteristic*, int code)
 {
     _owner->_lastStatusCode = code;
     xSemaphoreGive(_owner->_txDone);
@@ -79,7 +79,7 @@ void BLEManager::TxCharCB::onStatus(NimBLECharacteristic*, int code)
 //  RX characteristic callback
 // ─────────────────────────────────────────────────────────────────────────────
 
-void BLEManager::RxCharCB::onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo&)
+void BleTransport::RxCharCB::onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo&)
 {
     std::string v = pChar->getValue();
     size_t n = v.size();
@@ -90,26 +90,28 @@ void BLEManager::RxCharCB::onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo&)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BLEManager
+//  BleTransport
 // ─────────────────────────────────────────────────────────────────────────────
 
-BLEManager::BLEManager()
+BleTransport::BleTransport()
 {
-    // Stream buffer: 8KB storage, trigger level 1 (wake drain task on any byte)
-    // Trigger level 1 means the drain task wakes as soon as any data arrives.
-    // The receive timeout handles the "few bytes idle" case -- drain task uses
-    // a 5ms timeout so partial flushes are always delivered promptly.
-    _txStream = xStreamBufferCreate(TX_STREAM_BUF_SIZE, 1);
-    configASSERT(_txStream);
-
-    // Binary semaphore -- starts taken. Given by onSubscribe and onStatus.
-    _txDone = xSemaphoreCreateBinary();
-    configASSERT(_txDone);
+    // No heap allocations here — constructor runs before FreeRTOS scheduler.
+    // Stream buffer and semaphore are created in begin().
 }
 
-void BLEManager::begin()
+void BleTransport::begin()
 {
-    NimBLEDevice::init("ESP32-GPS");
+    // Create stream buffer and semaphore now that heap is available
+    if (_txStream == nullptr) {
+        _txStream = xStreamBufferCreate(TX_STREAM_BUF_SIZE, 1);
+        configASSERT(_txStream);
+    }
+    if (_txDone == nullptr) {
+        _txDone = xSemaphoreCreateBinary();
+        configASSERT(_txDone);
+    }
+
+    NimBLEDevice::init("ESP32-Display");
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
     Serial.printf("[BLE] MAC: %s\n", NimBLEDevice::getAddress().toString().c_str());
@@ -148,13 +150,13 @@ void BLEManager::begin()
     startAdvertising();
 }
 
-void BLEManager::startAdvertising()
+void BleTransport::startAdvertising()
 {
     NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
     adv->addServiceUUID(SERVICE_UUID);
 
     NimBLEAdvertisementData scanResp;
-    scanResp.setName("ESP32-GPS");
+    scanResp.setName("ESP32-Display");
     adv->setScanResponseData(scanResp);
     adv->setMinInterval(48);
     adv->setMaxInterval(160);
@@ -162,12 +164,12 @@ void BLEManager::startAdvertising()
     Serial.println("[BLE] advertising started");
 }
 
-bool BLEManager::canSend() const
+bool BleTransport::canSend() const
 {
     return _connected && _notifySubscribed && (pTxChar != nullptr);
 }
 
-uint16_t BLEManager::effectiveChunkSize() const
+uint16_t BleTransport::effectiveChunkSize() const
 {
     uint16_t maxPayload = (_mtu > 23) ? (_mtu - 3) : 20;
     return maxPayload;
@@ -180,7 +182,7 @@ uint16_t BLEManager::effectiveChunkSize() const
 //  If the stream buffer is full (8KB backlog) xStreamBufferSend will block
 //  briefly -- this is the correct backpressure point and is rarely hit.
 // ─────────────────────────────────────────────────────────────────────────────
-void BLEManager::sendBytes(const uint8_t *data, uint16_t len)
+void BleTransport::send(const uint8_t *data, uint16_t len)
 {
     if (!data || len == 0) return;
     if (!canSend()) return;
@@ -194,7 +196,7 @@ void BLEManager::sendBytes(const uint8_t *data, uint16_t len)
     // The connection watchdog will detect the dead link and call onDisconnect,
     // which triggers initPhoneUI() on reconnect for a full redraw.
     // Write to stream buffer -- block until space is available.
-    // Uses portMAX_DELAY matching the old semaphore-gated sendBytes() behavior:
+    // Uses portMAX_DELAY matching the old semaphore-gated send() behavior:
     // the GFX task blocks if BLE can't keep up, and NimBLE's supervision
     // timeout is the ultimate dead-link detector that fires onDisconnect.
     // On disconnect the stream buffer is flushed and initPhoneUI() redraws.
@@ -221,12 +223,12 @@ void BLEManager::sendBytes(const uint8_t *data, uint16_t len)
 //  The 5ms receive timeout is the "idle flush" mechanism -- any bytes sitting
 //  in the buffer are drained within 5ms even if less than one MTU worth.
 // ─────────────────────────────────────────────────────────────────────────────
-void BLEManager::drainTaskFunc(void *arg)
+void BleTransport::drainTaskFunc(void *arg)
 {
-    static_cast<BLEManager*>(arg)->runDrainLoop();
+    static_cast<BleTransport*>(arg)->runDrainLoop();
 }
 
-void BLEManager::runDrainLoop()
+void BleTransport::runDrainLoop()
 {
     // Local retry buffer -- holds the current chunk until successfully sent.
     // Keeping it here (not re-injecting into the stream buffer) preserves
@@ -324,9 +326,9 @@ void BLEManager::runDrainLoop()
     }
 }
 
-bool BLEManager::hasRxData() const { return rxLen > 0; }
+bool BleTransport::hasRxData() const { return rxLen > 0; }
 
-size_t BLEManager::readRx(uint8_t *dst, size_t maxLen)
+size_t BleTransport::readRx(uint8_t *dst, size_t maxLen)
 {
     size_t n = (rxLen < maxLen) ? rxLen : maxLen;
     memcpy(dst, rxBuf, n);

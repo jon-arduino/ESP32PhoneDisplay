@@ -6,6 +6,7 @@
 #include <freertos/semphr.h>
 #include <freertos/stream_buffer.h>
 #include "../Protocol.h"
+#include "../GraphicsTransport.h"
 #include "../BackChannelParser.h"
 
 // Nordic UART Service UUIDs
@@ -13,10 +14,10 @@ static const char *SERVICE_UUID           = "6E400001-B5A3-F393-E0A9-E50E24DCCA9
 static const char *TX_CHARACTERISTIC_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 static const char *RX_CHARACTERISTIC_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
 
-class BLEManager
+class BleTransport : public GraphicsTransport
 {
 public:
-    BLEManager();
+    BleTransport();
 
     void begin();
     void startAdvertising();
@@ -29,7 +30,7 @@ public:
     // portMAX_DELAY = block forever (stall caller until BLE drains).
     // Default: 500ms — matches roughly 2 BLE connection intervals of backlog,
     // after which the link is probably lost and dropping is better than stalling.
-    void sendBytes(const uint8_t *data, uint16_t len);
+    void send(const uint8_t *data, uint16_t len) override;
 
     // Configure how long sendBytes() waits when the TX buffer is full.
     // Call before begin(). Default is 500ms.
@@ -39,8 +40,8 @@ public:
 
     // Callbacks
     void onKey(std::function<void(uint8_t)> cb)                     { _bc.onKey(cb);   }
-    void onTouch(std::function<void(uint8_t, int16_t, int16_t)> cb) { _bc.onTouch(cb); }
-    void onSubscribed(void (*cb)(bool ready)) { _subscribedCallback = cb; }
+    void onTouch(std::function<void(uint8_t, int16_t, int16_t, uint8_t)> cb) override { _bc.onTouch(cb); }
+    void onSubscribed(std::function<void(bool)> cb) { _subscribedCallback = cb; }
 
     // RX
     bool   hasRxData() const;
@@ -84,7 +85,7 @@ private:
     volatile size_t rxLen = 0;
 
     BackChannelParser _bc;
-    void (*_subscribedCallback)(bool ready) = nullptr;
+    std::function<void(bool)> _subscribedCallback;
 
     // ── Drain task ────────────────────────────────────────────────────────────
     static void drainTaskFunc(void *arg);
@@ -93,28 +94,28 @@ private:
     // ── NimBLE callbacks ──────────────────────────────────────────────────────
     class ServerCB : public NimBLEServerCallbacks {
     public:
-        explicit ServerCB(BLEManager *o) : _owner(o) {}
+        explicit ServerCB(BleTransport *o) : _owner(o) {}
         void onConnect(NimBLEServer*, NimBLEConnInfo&) override;
         void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override;
         void onMTUChange(uint16_t mtu, NimBLEConnInfo&) override;
     private:
-        BLEManager *_owner;
+        BleTransport *_owner;
     };
 
     class TxCharCB : public NimBLECharacteristicCallbacks {
     public:
-        explicit TxCharCB(BLEManager *o) : _owner(o) {}
+        explicit TxCharCB(BleTransport *o) : _owner(o) {}
         void onSubscribe(NimBLECharacteristic*, NimBLEConnInfo&, uint16_t) override;
         void onStatus(NimBLECharacteristic*, int) override;
     private:
-        BLEManager *_owner;
+        BleTransport *_owner;
     };
 
     class RxCharCB : public NimBLECharacteristicCallbacks {
     public:
-        explicit RxCharCB(BLEManager *o) : _owner(o) {}
+        explicit RxCharCB(BleTransport *o) : _owner(o) {}
         void onWrite(NimBLECharacteristic*, NimBLEConnInfo&) override;
     private:
-        BLEManager *_owner;
+        BleTransport *_owner;
     };
 };
