@@ -319,7 +319,7 @@ void loop()
     // Draw triangle if running
     if (_running) {
         drawNextTriangle();
-        delay(10);
+        delay(1);
         // No explicit flush — auto-flush handles it for max throughput
     }
 }

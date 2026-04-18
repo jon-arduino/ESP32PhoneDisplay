@@ -2,6 +2,25 @@
 #include <string.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Design notes
+//
+//  send() accumulates GFX bytes into _txBuf (std::vector) under _writeMutex.
+//  flush() drains _txBuf to TCP under _writeMutex.
+//  A background task handles ping/pong and auto-flush — it takes _writeMutex
+//  with zero timeout so it never blocks loop().
+//
+//  _client->write() is only ever called while _writeMutex is held, which
+//  serialises all TCP writes and prevents concurrent access to AsyncTCP.
+//
+//  The task sleeps for TASK_SLEEP_MS between iterations so IDLE and other
+//  tasks get CPU time — no watchdog starvation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static constexpr uint32_t TASK_SLEEP_MS  = 10;   // task yield interval
+static constexpr uint32_t AUTO_FLUSH_MS  = 100;  // max time bytes sit in _txBuf
+static constexpr uint32_t WRITE_TIMEOUT  = 2000; // max ms for a single TCP write
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Constructor
 // ─────────────────────────────────────────────────────────────────────────────
 WiFiTransport::WiFiTransport(const char *ssid, const char *password,
@@ -19,6 +38,13 @@ WiFiTransport::WiFiTransport(const char *ssid, const char *password,
 // ─────────────────────────────────────────────────────────────────────────────
 void WiFiTransport::begin()
 {
+    // Heap allocations here — safe, called from setup() after scheduler starts
+    if (_writeMutex == nullptr) {
+        _writeMutex = xSemaphoreCreateMutex();
+        configASSERT(_writeMutex);
+    }
+    _txBuf.reserve(TX_BUF_RESERVE);
+
     WiFi.mode(_apSsid ? WIFI_AP_STA : WIFI_STA);
     WiFi.begin(_ssid, _password);
     Serial.print("[WiFi] Connecting");
@@ -59,96 +85,97 @@ bool WiFiTransport::isConnected() const
     return _apMode || (WiFi.status() == WL_CONNECTED);
 }
 
-// Write framed packet [lenLo][lenHi][data] into ring buffer.
-// Blocks if ring is full — never drops.
+// Accumulate bytes into _txBuf — called from loop()/sketch task.
+// Takes mutex with portMAX_DELAY — suspends properly, IDLE runs, no watchdog.
 void WiFiTransport::send(const uint8_t *data, uint16_t len)
 {
     if (!data || len == 0 || !canSend()) return;
 
-    // Hard limit — a single send() call must fit in the ring buffer.
-    // Max payload is 8KB (fits a 64x64 RGB565 bitmap with room to spare).
-    // Callers with larger payloads must chunk their data.
-    if (len > MAX_PAYLOAD_SIZE) {
-        Serial.printf("[WiFi] send() payload too large (%u bytes, max %u) — dropped\n",
-                      len, (unsigned)MAX_PAYLOAD_SIZE);
+    xSemaphoreTake(_writeMutex, portMAX_DELAY);
+    _txBuf.insert(_txBuf.end(), data, data + len);
+    _lastSendMs = millis();
+    xSemaphoreGive(_writeMutex);
+}
+
+// Drain _txBuf to TCP — called from sketch at frame boundaries.
+// Takes mutex with portMAX_DELAY.
+void WiFiTransport::flush()
+{
+    xSemaphoreTake(_writeMutex, portMAX_DELAY);
+    flushLocked();
+    xSemaphoreGive(_writeMutex);
+}
+
+// Discard buffer — called on disconnect.
+void WiFiTransport::reset()
+{
+    xSemaphoreTake(_writeMutex, portMAX_DELAY);
+    _txBuf.clear();
+    _lastSendMs = 0;
+    xSemaphoreGive(_writeMutex);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  flushLocked() — caller MUST hold _writeMutex
+// ─────────────────────────────────────────────────────────────────────────────
+void WiFiTransport::flushLocked()
+{
+    if (_txBuf.empty() || !canSend()) {
+        _txBuf.clear();
+        _lastSendMs = 0;
         return;
     }
 
-    const uint32_t needed = len + 2;   // 2 byte length header + data
+    size_t   total   = _txBuf.size();
+    size_t   sent    = 0;
+    uint32_t start   = millis();
 
-    // Spinwait for space — blocks rather than drops
-    {
-        static uint32_t lastRingFullLogMs = 0;
-        bool needsLog = false;
-        while (ringFree() < needed) {
-            if (!needsLog && (millis() - lastRingFullLogMs >= 1000)) {
-                needsLog = true;
+    while (sent < total) {
+        size_t space = _client->space();
+        if (space == 0) {
+            if (millis() - start > WRITE_TIMEOUT) {
+                Serial.printf("[WiFi] flush timeout — sent %u/%u bytes\n",
+                              sent, total);
+                break;
             }
-            taskYIELD();
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
         }
-        if (needsLog) {
-            lastRingFullLogMs = millis();
-            Serial.printf("[WiFi] Ring full — was blocked (%u bytes)\n", needed);
+        size_t chunk   = min(space, total - sent);
+        size_t written = _client->write(
+            reinterpret_cast<const char *>(_txBuf.data() + sent), chunk);
+        if (written == 0) {
+            // AsyncTCP not ready — brief yield and retry
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
         }
+        sent  += written;
+        start  = millis();
     }
 
-    // Write packet into ring — wrapping if needed
-    uint32_t head = _head.load(std::memory_order_relaxed);
-    uint32_t pos  = head;
-
-    // Write length header
-    _txBuf[pos % TX_BUF_SIZE] = len & 0xFF;         pos++;
-    _txBuf[pos % TX_BUF_SIZE] = (len >> 8) & 0xFF;  pos++;
-
-    // Write data — wraps automatically via modulo
-    for (uint16_t i = 0; i < len; i++) {
-        _txBuf[pos % TX_BUF_SIZE] = data[i];
-        pos++;
-    }
-
-    // Commit with monotonic counter — never wraps to 0
-    _head.store(pos, std::memory_order_release);
-    // Do NOT notify task here — let it wake on its 5ms timeout or on flush().
-    // Notifying on every send() prevents the task from ever sleeping,
-    // starving loopTask and IDLE on the same core.
-}
-
-// Notify transport task to drain ring now
-void WiFiTransport::flush()
-{
-    _flushRequested = true;
-    if (_taskHandle) xTaskNotify(_taskHandle, 1, eSetBits);
-}
-
-// Discard ring buffer — called on disconnect
-void WiFiTransport::reset()
-{
-    // Sync tail to head — buffer is now empty, monotonic relationship preserved
-    uint32_t head = _head.load(std::memory_order_acquire);
-    _tail.store(head, std::memory_order_release);
-    _flushRequested = false;
-    _lastDrainMs    = 0;
+    _txBuf.clear();
+    _lastSendMs  = 0;
+    _lastFlushMs = millis();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Ring buffer helpers
+//  sendPingLocked() — caller MUST hold _writeMutex
 // ─────────────────────────────────────────────────────────────────────────────
-uint32_t WiFiTransport::ringFree() const
+void WiFiTransport::sendPingLocked()
 {
-    uint32_t head = _head.load(std::memory_order_acquire);
-    uint32_t tail = _tail.load(std::memory_order_acquire);
-    return TX_BUF_SIZE - (head - tail) - 1;
-}
-
-uint32_t WiFiTransport::ringUsed() const
-{
-    uint32_t head = _head.load(std::memory_order_acquire);
-    uint32_t tail = _tail.load(std::memory_order_acquire);
-    return head - tail;
+    if (!canSend()) return;
+    uint8_t frame[4] = {0xA5, 0x01, 0x00, GFX_CMD_PING};
+    size_t written = _client->write(reinterpret_cast<const char *>(frame), 4);
+    if (written == 4) _ping.onPingSent();
+    // if write failed, pingNeeded() stays true — task retries next cycle
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Transport task
+//  Background task — ping/pong heartbeat + auto-flush
+//
+//  Sleeps TASK_SLEEP_MS between iterations so IDLE and other tasks run.
+//  Takes _writeMutex with zero timeout — never blocks loop().
+//  If mutex is busy (sketch calling send/flush), skips this cycle.
 // ─────────────────────────────────────────────────────────────────────────────
 void WiFiTransport::taskFunc(void *arg)
 {
@@ -158,15 +185,14 @@ void WiFiTransport::taskFunc(void *arg)
 void WiFiTransport::runTask()
 {
     for (;;) {
-        // Wait for notification or 5ms timeout for auto-flush check
-        xTaskNotifyWait(0, 0xFFFFFFFF, nullptr, pdMS_TO_TICKS(5));
+        // Sleep first — gives IDLE and loopTask guaranteed CPU time each cycle
+        vTaskDelay(pdMS_TO_TICKS(TASK_SLEEP_MS));
 
         if (!canSend()) {
             _ping.onDisconnected();
             continue;
         }
 
-        // Ping/pong heartbeat
         _ping.tick(millis());
 
         if (_ping.isTimedOut()) {
@@ -174,80 +200,21 @@ void WiFiTransport::runTask()
             continue;
         }
 
-        // Send ping between packets — never mid-packet
-        if (_ping.pingNeeded())
-            sendPingFrame();
+        // Zero-timeout mutex take — never blocks loop()
+        if (xSemaphoreTake(_writeMutex, 0) != pdTRUE) continue;
 
-        // Drain ring buffer
-        drainRing();
+        // Send ping if due — between GFX data, never mid-frame
+        if (_ping.pingNeeded()) sendPingLocked();
 
-        // Auto-flush — drain if bytes sitting idle > AUTO_FLUSH_MS
-        if (ringUsed() > 0 &&
-            _lastDrainMs > 0 &&
-            millis() - _lastDrainMs >= AUTO_FLUSH_MS)
-        {
-            drainRing();
+        // Auto-flush — flush at least every AUTO_FLUSH_MS regardless of
+        // how often send() is called. Prevents bursty display updates.
+        if (!_txBuf.empty() &&
+            millis() - _lastFlushMs >= AUTO_FLUSH_MS) {
+            flushLocked();
         }
 
-        _flushRequested = false;
+        xSemaphoreGive(_writeMutex);
     }
-}
-
-// Drain ring — sends complete packets only, never splits a command.
-// Breaks out if ping becomes due so runTask() can send it promptly.
-void WiFiTransport::drainRing()
-{
-    while (canSend()) {
-        // Ping has priority — break out so runTask() can send it
-        if (_ping.pingNeeded()) break;
-
-        uint32_t used = ringUsed();
-        if (used < 2) break;
-
-        uint32_t tail = _tail.load(std::memory_order_relaxed);
-
-        uint16_t len = _txBuf[tail % TX_BUF_SIZE] |
-                       (_txBuf[(tail + 1) % TX_BUF_SIZE] << 8);
-
-        if (len == 0 || used < (uint32_t)(len + 2)) break;
-
-        if (_client->space() < (size_t)len) break;
-
-        uint32_t dataStart = (tail + 2) % TX_BUF_SIZE;
-        uint32_t firstPart = TX_BUF_SIZE - dataStart;
-
-        size_t written = 0;
-        if (firstPart >= len) {
-            written = _client->write(
-                reinterpret_cast<const char *>(&_txBuf[dataStart]), len);
-        } else {
-            uint8_t tmp[512];
-            if (len <= sizeof(tmp)) {
-                memcpy(tmp, &_txBuf[dataStart], firstPart);
-                memcpy(tmp + firstPart, &_txBuf[0], len - firstPart);
-                written = _client->write(
-                    reinterpret_cast<const char *>(tmp), len);
-            }
-        }
-
-        if (written == 0) {
-            taskYIELD();   // give AsyncTCP task time to process, then retry
-            continue;      // tail not advanced — same packet will retry
-        }
-
-        _tail.store(tail + 2 + len, std::memory_order_release);
-        _lastDrainMs = millis();
-    }
-}
-
-// Send ping frame — called only from transport task between packets
-void WiFiTransport::sendPingFrame()
-{
-    if (!canSend()) return;
-    uint8_t frame[4] = {0xA5, 0x01, 0x00, GFX_CMD_PING};
-    size_t written = _client->write(reinterpret_cast<const char *>(frame), 4);
-    if (written == 4) _ping.onPingSent();
-    // if write failed, pingNeeded() stays true — task retries next cycle
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -322,8 +289,10 @@ void WiFiTransport::startTCPServer()
 void WiFiTransport::spawnTask()
 {
     if (_taskHandle != nullptr) return;
+    // Core 0 — away from loopTask (core 1), alongside WiFi stack.
+    // Task sleeps TASK_SLEEP_MS each cycle so IDLE0 runs freely.
     xTaskCreatePinnedToCore(
-        taskFunc, "wifi_transport", 4096, this, 3, &_taskHandle, 1);
+        taskFunc, "wifi_transport", 4096, this, 1, &_taskHandle, 0);
 }
 
 void WiFiTransport::onClientConnected(AsyncClient *client)
@@ -335,10 +304,15 @@ void WiFiTransport::onClientConnected(AsyncClient *client)
     }
 
     _client = client;
-    _client->setNoDelay(true);   // disable Nagle for low latency
+    _client->setNoDelay(true);
 
     _bc.reset();
-    reset();
+
+    // Reset buffer without mutex — called from AsyncTCP task, 
+    // transport task not yet running for this connection
+    _txBuf.clear();
+    _lastSendMs = 0;
+
     _ping.onConnected();
 
     Serial.printf("[WiFi] iPhone connected from %s\n",
@@ -357,7 +331,12 @@ void WiFiTransport::onClientConnected(AsyncClient *client)
         if (self->_client == c) {
             self->_client = nullptr;
             self->_ping.onDisconnected();
-            self->reset();
+            if (self->_writeMutex) {
+                xSemaphoreTake(self->_writeMutex, portMAX_DELAY);
+                self->_txBuf.clear();
+                self->_lastSendMs = 0;
+                xSemaphoreGive(self->_writeMutex);
+            }
             if (self->_onDisconnected) self->_onDisconnected();
         }
         delete c;
@@ -369,7 +348,12 @@ void WiFiTransport::onClientConnected(AsyncClient *client)
         if (self->_client == c) {
             self->_client = nullptr;
             self->_ping.onDisconnected();
-            self->reset();
+            if (self->_writeMutex) {
+                xSemaphoreTake(self->_writeMutex, portMAX_DELAY);
+                self->_txBuf.clear();
+                self->_lastSendMs = 0;
+                xSemaphoreGive(self->_writeMutex);
+            }
             if (self->_onDisconnected) self->_onDisconnected();
         }
     }, this);
