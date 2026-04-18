@@ -216,3 +216,7 @@ the connection supervision timeout.
 - Default port: 9000 (configurable in WiFiTransport constructor)
 - Protocol: raw TCP byte stream — frames are self-delimiting via the 3-byte header
 - Both GFX stream and back-channel share the same TCP connection
+- Nagle algorithm disabled (`TCP_NODELAY`) for low-latency command delivery
+- **Maximum single frame payload: 8192 bytes** — fits a 64×64 RGB565 bitmap.
+  Frames larger than 8KB are dropped with a Serial warning. Chunk large
+  bitmaps by row or tile and send multiple frames.

@@ -3,40 +3,38 @@
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <AsyncTCP.h>
-#include <freertos/semphr.h>
-#include <vector>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <atomic>
 #include <functional>
 
 #include "../GraphicsTransport.h"
 #include "../GraphicsProtocol.h"
 #include "../Protocol.h"
 #include "../BackChannelParser.h"
+#include "PingPong.h"
 
 // -----------------------------------------------------------------------------
 //  WiFiTransport — WiFi transport for ESP32PhoneDisplay
 //
-//  Connects to WiFi, advertises via mDNS, accepts a TCP connection from the
-//  iPhone app, and streams GFX commands over TCP.
+//  Architecture:
+//    send()  — writes framed packet [lenLo][lenHi][data] into ring buffer.
+//              Returns immediately. Notifies transport task.
+//    flush() — notifies transport task to drain ring now.
+//    Transport task (core 0) — sole writer to TCP socket.
+//              Drains ring buffer, sends pings, handles auto-flush.
+//              No mutex needed — single writer on TCP socket.
 //
-//  GFX bytes are accumulated in an internal buffer and sent as a single TCP
-//  write on flush(). This batching avoids Nagle algorithm delays and
-//  head-of-line blocking on iOS.
+//  Ring buffer:
+//    Fixed 8KB SPSC ring. Producer: send() on loop/any task.
+//    Consumer: transport task. std::atomic head/tail for thread safety.
+//    Packets stored as [lenLo][lenHi][data...] — never split on send.
 //
-//  A background FreeRTOS task handles:
-//    - Ping/pong heartbeat (keeps iPhone connection alive)
-//    - Auto-flush (sends buffered bytes within 100ms if flush() not called)
+//  Ping/pong:
+//    Managed by PingPong object. Transport task checks pingNeeded() and
+//    sends ping between packets — never mid-packet.
 //
-//  Nothing required in loop() — the task manages everything automatically.
-//
-//  Usage:
-//    WiFiTransport transport("MySSID", "MyPassword", "esp32-display");
-//    transport.setSoftAP("ESP32-Display", "password123");  // optional fallback
-//    transport.begin();
-//
-//    while (!transport.canSend()) { delay(100); }  // wait for iPhone
-//    display.begin(240, 320);
-//    display.fillScreen(0x0000);
-//    display.flush();   // recommended — not required
+//  Nothing required in loop() — transport task manages everything.
 // -----------------------------------------------------------------------------
 
 class WiFiTransport : public GraphicsTransport
@@ -48,8 +46,6 @@ public:
                   uint16_t    tcpPort      = 9000);
 
     // ── SoftAP fallback ───────────────────────────────────────────────────────
-    // Call before begin(). If STA connection fails within staTimeoutMs,
-    // ESP32 starts its own network. iPhone joins it manually then connects.
     void setSoftAP(const char *apSsid,
                    const char *apPassword,
                    uint32_t    staTimeoutMs = 15000)
@@ -59,61 +55,57 @@ public:
         _staTimeoutMs = staTimeoutMs;
     }
 
-    // Connect to WiFi, start mDNS + TCP server, spawn background task.
-    // Blocks until WiFi associates (or SoftAP fallback starts).
-    // Does not wait for iPhone to connect — use canSend() to check.
+    // Connect to WiFi, start mDNS + TCP server, spawn transport task.
     void begin();
 
     // ── GraphicsTransport interface ───────────────────────────────────────────
 
-    // True when an iPhone TCP client is connected and ready.
+    // True when an iPhone TCP client is connected.
     bool canSend() const override;
 
-    // Accumulate bytes into internal buffer. Thread-safe.
-    // Nothing sent to TCP until flush() or auto-flush (within 100ms).
+    // Write framed packet into ring buffer. Blocks briefly if ring is full.
+    // Never drops — blocks until space is available (max ~50ms warning).
     void send(const uint8_t *data, uint16_t len) override;
 
-    // Send entire accumulated buffer as one TCP write.
-    // Call at explicit frame boundaries for deterministic rendering.
-    // Not required — auto-flush sends within 100ms if not called.
+    // Notify transport task to drain ring immediately.
     void flush() override;
 
-    // Discard buffered bytes without sending.
-    // Called automatically on disconnect to prevent stale data.
+    // Discard ring buffer contents — called on disconnect.
     void reset() override;
 
     // ── Touch back-channel ────────────────────────────────────────────────────
-    void onTouch(std::function<void(uint8_t cmd,
-                                    int16_t x,
-                                    int16_t y,
-                                    uint8_t z)> cb) override
+    void onTouch(std::function<void(uint8_t, int16_t, int16_t, uint8_t)> cb) override
     {
         _bc.onTouch(cb);
     }
 
     // ── Status ────────────────────────────────────────────────────────────────
-    bool isConnected()   const;   // WiFi associated (not necessarily iPhone connected)
-    bool isInAPMode()    const { return _apMode; }
+    bool isConnected() const;
+    bool isInAPMode()  const { return _apMode; }
 
     // ── Configuration ─────────────────────────────────────────────────────────
     void setHeartbeat(uint32_t pingIntervalMs, uint32_t pongTimeoutMs)
     {
-        _pingIntervalMs = pingIntervalMs;
-        _pongTimeoutMs  = pongTimeoutMs;
-        _pingEarlyMs    = pingIntervalMs / 3;
+        _ping.setInterval(pingIntervalMs);
+        _ping.setTimeout(pongTimeoutMs);
     }
 
-    void setPingEarlyMs(uint32_t earlyMs) { _pingEarlyMs = earlyMs; }
+    // ── RTT statistics ────────────────────────────────────────────────────────
+    uint32_t rttLast()  const { return _ping.rttLast();  }
+    uint32_t rttMin()   const { return _ping.rttMin();   }
+    uint32_t rttMax()   const { return _ping.rttMax();   }
+    uint32_t rttAvg()   const { return _ping.rttAvg();   }
+    uint32_t rttCount() const { return _ping.rttCount(); }
+    void     resetRttStats()  { _ping.resetStats();      }
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
-    void onConnected   (std::function<void()> cb) { _onConnected    = cb; }
-    void onDisconnected(std::function<void()> cb) { _onDisconnected = cb; }
-    void onFirstPong   (std::function<void()> cb) { _onFirstPong    = cb; }
-    void onKey         (std::function<void(uint8_t)> cb) { _bc.onKey(cb); }
+    void onConnected   (std::function<void()> cb)          { _onConnected    = cb; }
+    void onDisconnected(std::function<void()> cb)          { _onDisconnected = cb; }
+    void onFirstPong   (std::function<void()> cb)          { _ping.onFirstPong(cb); }
+    void onRtt         (std::function<void(uint32_t)> cb)  { _ping.onRtt(cb); }
+    void onKey         (std::function<void(uint8_t)> cb)   { _bc.onKey(cb);  }
 
     // ── SoftAP switch ─────────────────────────────────────────────────────────
-    // Drop current connection and switch to SoftAP mode on demand.
-    // Requires setSoftAP() to have been called first.
     void switchToSoftAP();
 
 private:
@@ -132,54 +124,41 @@ private:
     AsyncServer *_server = nullptr;
     AsyncClient *_client = nullptr;
 
-    // ── TX buffer ─────────────────────────────────────────────────────────────
-    // Accumulates GFX bytes between flush() calls.
-    // Mutex protects both _txBuf (in send()) and TCP writes (in flushLocked(),
-    // sendPingNow()) from concurrent access between the background task and
-    // any task calling send()/flush().
-    std::vector<uint8_t> _txBuf;
-    uint32_t             _lastSendMs = 0;
-    static constexpr size_t TX_BUF_RESERVE = 4096;
-    static constexpr uint32_t AUTO_FLUSH_MS = 100;
+    // ── Ring buffer (SPSC — send() produces, transport task consumes) ─────────
+    static constexpr size_t    TX_BUF_SIZE      = 16384;  // ring buffer
+    static constexpr size_t    MAX_PAYLOAD_SIZE = 8192;   // max single send() call
+    static constexpr uint32_t  AUTO_FLUSH_MS = 100;
 
-    SemaphoreHandle_t _writeMutex = nullptr;
+    uint8_t                  _txBuf[TX_BUF_SIZE];
+    std::atomic<uint32_t>    _head{0};   // producer index (send())
+    std::atomic<uint32_t>    _tail{0};   // consumer index (transport task)
+    std::atomic<bool>        _flushRequested{false};
+    uint32_t                 _lastDrainMs = 0;
 
-    // ── Heartbeat ─────────────────────────────────────────────────────────────
-    uint32_t _pingIntervalMs   = 3000;
-    uint32_t _pongTimeoutMs    = 9000;
-    uint32_t _pingEarlyMs      = 1000;
-    uint32_t _lastPingSentMs   = 0;
-    bool     _waitingForPong   = false;
-    bool     _pingNeeded       = false;
-    uint8_t  _loggedThresholds = 0;
+    // ── Transport task ────────────────────────────────────────────────────────
+    TaskHandle_t _taskHandle = nullptr;
+    static void  taskFunc(void *arg);
+    void         runTask();
+    void         drainRing();
+    void         sendPingFrame();
+    void         spawnTask();
+
+    // ── Ring buffer helpers ───────────────────────────────────────────────────
+    uint32_t ringFree() const;
+    uint32_t ringUsed() const;
+
+    // ── Ping/pong ─────────────────────────────────────────────────────────────
+    PingPong _ping;
 
     // ── Callbacks ─────────────────────────────────────────────────────────────
     std::function<void()> _onConnected;
     std::function<void()> _onDisconnected;
-    std::function<void()> _onFirstPong;
-    bool _firstPongReceived   = false;
+    BackChannelParser     _bc;
 
-    BackChannelParser _bc;
-
-    // ── Background task ───────────────────────────────────────────────────────
-    TaskHandle_t _taskHandle = nullptr;
-    static void  taskFunc(void *arg);
-
-    // ── Private methods ───────────────────────────────────────────────────────
-    void update();      // heartbeat — called from task, zero-timeout mutex take
-    void autoFlush();   // flush if bytes idle > AUTO_FLUSH_MS — called from task
-
-    // Send _txBuf over TCP — caller must hold _writeMutex
-    void flushLocked();
-
-    // Send ping frame — caller must hold _writeMutex
-    void sendPingNow();
-
+    // ── Private helpers ───────────────────────────────────────────────────────
     void startMDNS();
     void startTCPServer();
     void startSoftAP();
-    void spawnTask();
-
     void onClientConnected(AsyncClient *client);
     void dropClient(const char *reason);
 };

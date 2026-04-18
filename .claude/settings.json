@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:docs.arduino.cc)",
+      "WebFetch(domain:www.arduino.cc)",
+      "WebFetch(domain:www.arduinolibraries.info)",
+      "WebFetch(domain:registry.platformio.org)"
+    ]
+  }
+}

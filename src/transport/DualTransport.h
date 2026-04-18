@@ -34,8 +34,8 @@
 // -----------------------------------------------------------------------------
 
 #include "GraphicsTransport.h"
-#include "BleTransport.h"
-#include "WiFiTransport.h"
+#include "transport/BleTransport.h"
+#include "transport/WiFiTransport.h"
 #include <functional>
 
 class DualTransport : public GraphicsTransport
@@ -163,6 +163,14 @@ public:
         if (_active == &_wifi) return "WiFi";
         return "none";
     }
+
+    // ── RTT statistics (WiFi only — returns 0 when BLE active) ───────────────
+    uint32_t rttLast()  const { return _wifi.rttLast();  }
+    uint32_t rttMin()   const { return _wifi.rttMin();   }
+    uint32_t rttMax()   const { return _wifi.rttMax();   }
+    uint32_t rttAvg()   const { return _wifi.rttAvg();   }
+    uint32_t rttCount() const { return _wifi.rttCount(); }
+    void     resetRttStats()  { _wifi.resetRttStats();   }
 
 private:
     BleTransport      _ble;
