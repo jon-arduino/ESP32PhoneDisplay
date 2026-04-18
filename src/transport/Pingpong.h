@@ -5,22 +5,6 @@
 
 // -----------------------------------------------------------------------------
 //  PingPong — WiFi connection health monitor and RTT measurement
-//
-//  Manages the ping/pong heartbeat used to detect dropped WiFi connections.
-//  Tracks round-trip time statistics for latency measurement.
-//
-//  How it works:
-//    - WiFiTransport background task calls tick() every 100ms
-//    - When ping interval elapses, pingNeeded() returns true
-//    - WiFiTransport sends the ping frame and calls onPingSent()
-//    - When pong arrives, WiFiTransport calls onPongReceived()
-//    - RTT = millis() at pong - millis() at ping send
-//    - If no pong within timeout, isTimedOut() returns true
-//    - WiFiTransport drops the client when isTimedOut()
-//
-//  RTT statistics:
-//    Updated on every pong. App can read at any time.
-//    Only valid when count() > 0.
 // -----------------------------------------------------------------------------
 
 class PingPong
@@ -28,42 +12,24 @@ class PingPong
 public:
     PingPong() = default;
 
-    // ── Configuration ─────────────────────────────────────────────────────────
     void setInterval(uint32_t intervalMs) { _intervalMs = intervalMs; }
     void setTimeout (uint32_t timeoutMs)  { _timeoutMs  = timeoutMs;  }
 
     void onRtt      (std::function<void(uint32_t rttMs)> cb) { _onRtt       = cb; }
     void onFirstPong(std::function<void()> cb)               { _onFirstPong = cb; }
 
-    // ── Called by WiFiTransport ───────────────────────────────────────────────
-
     void tick(uint32_t nowMs)
     {
         if (!_active) return;
 
-        // Pong watchdog
         if (_waitingForPong) {
             uint32_t elapsed = nowMs - _pingSentAt;
-
-            if (elapsed >= 500  && !(_logged & 1)) {
-                _logged |= 1;
-                Serial.printf("[Ping] Late %ums — link may be slow\n", elapsed);
-            }
-            if (elapsed >= 1500 && !(_logged & 2)) {
-                _logged |= 2;
-                Serial.printf("[Ping] Late %ums — WARNING\n", elapsed);
-            }
-            if (elapsed >= 6000 && !(_logged & 4)) {
-                _logged |= 4;
-                Serial.printf("[Ping] Late %ums — CRITICAL\n", elapsed);
-            }
-            if (elapsed >= _timeoutMs) {
-                _timedOut = true;
-                return;
-            }
+            if (elapsed >= 500  && !(_logged & 1)) { _logged |= 1; Serial.printf("[Ping] Late %ums — link may be slow\n", elapsed); }
+            if (elapsed >= 1500 && !(_logged & 2)) { _logged |= 2; Serial.printf("[Ping] Late %ums — WARNING\n", elapsed); }
+            if (elapsed >= 6000 && !(_logged & 4)) { _logged |= 4; Serial.printf("[Ping] Late %ums — CRITICAL\n", elapsed); }
+            if (elapsed >= _timeoutMs) { _timedOut = true; return; }
         }
 
-        // Schedule ping if interval elapsed
         if (nowMs - _pingSentAt >= _intervalMs)
             _pingNeeded = true;
     }
@@ -82,7 +48,6 @@ public:
     void onPongReceived()
     {
         if (!_waitingForPong) return;
-
         uint32_t rtt    = millis() - _pingSentAt;
         _waitingForPong = false;
         _timedOut       = false;
@@ -104,7 +69,7 @@ public:
         _pingNeeded     = false;
         _timedOut       = false;
         _logged         = 0;
-        _pingSentAt     = millis();  // grace period — don't timeout immediately
+        _pingSentAt     = millis();
         _active         = true;
     }
 
@@ -116,7 +81,6 @@ public:
         _timedOut       = false;
     }
 
-    // ── RTT statistics ────────────────────────────────────────────────────────
     uint32_t rttLast()  const { return _lastRtt;  }
     uint32_t rttMin()   const { return _minRtt;   }
     uint32_t rttMax()   const { return _maxRtt;   }
@@ -125,11 +89,7 @@ public:
 
     void resetStats()
     {
-        _lastRtt  = 0;
-        _minRtt   = 0;
-        _maxRtt   = 0;
-        _totalRtt = 0;
-        _count    = 0;
+        _lastRtt = _minRtt = _maxRtt = _totalRtt = _count = 0;
     }
 
 private:

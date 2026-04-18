@@ -82,6 +82,15 @@ public:
         _ping.setTimeout(pongTimeoutMs);
     }
 
+    // WiFi power saving — enabled by default (good for battery devices).
+    // Disable for low latency interactive apps — trades power for ~5ms RTT.
+    // Can be called before or after begin(); applied on connect/reconnect.
+    void setPowerSave(bool enable)
+    {
+        _powerSave = enable;
+        if (isConnected()) WiFi.setSleep(enable);
+    }
+
     // ── Callbacks ─────────────────────────────────────────────────────────────
     void onConnected   (std::function<void()> cb)         { _onConnected    = cb; }
     void onDisconnected(std::function<void()> cb)         { _onDisconnected = cb; }
@@ -103,6 +112,7 @@ private:
     const char *_apPassword   = nullptr;
     uint32_t    _staTimeoutMs = 15000;
     bool        _apMode       = false;
+    bool        _powerSave     = true;   // WiFi modem sleep — on by default
 
     // ── TCP ───────────────────────────────────────────────────────────────────
     AsyncServer *_server = nullptr;

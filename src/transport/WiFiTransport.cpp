@@ -66,6 +66,7 @@ void WiFiTransport::begin()
     Serial.printf("\n[WiFi] Connected — IP: %s\n",
                   WiFi.localIP().toString().c_str());
     _apMode = false;
+    WiFi.setSleep(_powerSave);   // apply power save setting
     startMDNS();
     startTCPServer();
     spawnTask();
@@ -259,6 +260,7 @@ void WiFiTransport::startSoftAP()
     WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0));
     Serial.printf("[WiFi] SoftAP — SSID: %s  IP: %s\n",
                   _apSsid, WiFi.softAPIP().toString().c_str());
+    WiFi.setSleep(_powerSave);
     startMDNS();
     startTCPServer();
     spawnTask();
@@ -307,12 +309,7 @@ void WiFiTransport::onClientConnected(AsyncClient *client)
     _client->setNoDelay(true);
 
     _bc.reset();
-
-    // Reset buffer without mutex — called from AsyncTCP task, 
-    // transport task not yet running for this connection
-    _txBuf.clear();
-    _lastSendMs = 0;
-
+    reset();   // clears _txBuf under mutex — safe against background task
     _ping.onConnected();
 
     Serial.printf("[WiFi] iPhone connected from %s\n",

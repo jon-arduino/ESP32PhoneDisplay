@@ -197,6 +197,7 @@ void setup()
     Serial.begin(115200);
 
     transport.setSoftAP("ESP32-Display", "display123");
+    transport.setPowerSave(false);   // stop BLE, disable modem sleep for best WiFi performance
 
     transport.onConnected([]() {
         Serial.printf("[App] Connected via %s\n",
@@ -319,7 +320,6 @@ void loop()
     // Draw triangle if running
     if (_running) {
         drawNextTriangle();
-        delay(1);
         // No explicit flush — auto-flush handles it for max throughput
     }
 }

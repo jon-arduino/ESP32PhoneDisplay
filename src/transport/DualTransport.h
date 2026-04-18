@@ -88,6 +88,14 @@ public:
         // ── WiFi callbacks ────────────────────────────────────────────────────
         _wifi.onConnected([this]() {
             Serial.println("[Dual] WiFi connected — activating");
+            // If setPowerSave(false) was requested, shut down BLE stack now
+            // that WiFi is connected. Must be done before setPowerSave(false).
+            if (_disablePowerSave && !_bleStopped) {
+                Serial.println("[Dual] Shutting down BLE for full WiFi performance");
+                NimBLEDevice::deinit(true);
+                _bleStopped = true;
+                _wifi.setPowerSave(false);
+            }
             _active = &_wifi;
             if (_onConnected) _onConnected();
         });
@@ -172,10 +180,26 @@ public:
     uint32_t rttCount() const { return _wifi.rttCount(); }
     void     resetRttStats()  { _wifi.resetRttStats();   }
 
+    // ── WiFi power saving ─────────────────────────────────────────────────────
+    // setPowerSave(false) — when WiFi connects, fully shuts down BLE stack
+    // and disables WiFi modem sleep for maximum WiFi performance.
+    // This is a one-way operation — BLE cannot be restarted without a reboot.
+    // Only call this if you don't need BLE.
+    void setPowerSave(bool enable)
+    {
+        if (!enable) {
+            _disablePowerSave = true;   // deferred — applied when WiFi connects
+        } else if (!_disablePowerSave) {
+            _wifi.setPowerSave(true);
+        }
+    }
+
 private:
     BleTransport      _ble;
     WiFiTransport     _wifi;
-    GraphicsTransport *_active = nullptr;
+    GraphicsTransport *_active          = nullptr;
+    bool              _bleStopped       = false;
+    bool              _disablePowerSave = false;
 
     std::function<void()>        _onConnected;
     std::function<void()>        _onDisconnected;
