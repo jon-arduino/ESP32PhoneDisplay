@@ -236,6 +236,7 @@ void setup()
         }
     });
 
+    
     transport.begin();
     Serial.println("[App] Ready — connect via BLE or WiFi");
 }

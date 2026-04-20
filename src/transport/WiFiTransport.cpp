@@ -93,6 +93,15 @@ void WiFiTransport::send(const uint8_t *data, uint16_t len)
     if (!data || len == 0 || !canSend()) return;
 
     xSemaphoreTake(_writeMutex, portMAX_DELAY);
+
+    // Block if buffer is full — wait for background task to drain it.
+    // This prevents std::bad_alloc when loop() spins faster than auto-flush.
+    while (_txBuf.size() + len > TX_BUF_RESERVE) {
+        xSemaphoreGive(_writeMutex);
+        vTaskDelay(pdMS_TO_TICKS(1));   // yield — let background task flush
+        xSemaphoreTake(_writeMutex, portMAX_DELAY);
+    }
+
     _txBuf.insert(_txBuf.end(), data, data + len);
     _lastSendMs = millis();
     xSemaphoreGive(_writeMutex);

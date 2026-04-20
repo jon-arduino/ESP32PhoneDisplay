@@ -47,6 +47,8 @@ RemoteTouchScreen ts(transport);
 // ── State ─────────────────────────────────────────────────────────────────────
 uint16_t          currentColor = RED;
 volatile bool     drawPending  = false;
+int16_t           _lastX       = -1;
+int16_t           _lastY       = -1;
 
 // ── UI ───────────────────────────────────────────────────────────────────────
 
@@ -106,10 +108,13 @@ void setup()
     Serial.begin(115200);
 
     transport.setSoftAP("ESP32-Display", "display123");
+    transport.setPowerSave(false);   // shut down BLE on WiFi connect for smooth touch
 
     transport.onConnected([]() {
         Serial.printf("[App] Connected via %s\n",
                       transport.activeTransportName());
+        _lastX    = -1;
+        _lastY    = -1;
         ts.begin(TOUCH_MODE_RESISTIVE, 16);   // send TOUCH_BEGIN on every connect
         drawPending = true;
     });
@@ -139,7 +144,19 @@ void loop()
     }
 
     TSPoint p = ts.getPoint();
-    if (p.z <= RemoteTouchScreen::MINPRESSURE) return;
+
+    // if touch is released — reset last position so next touch is always fresh
+    if (p.z <= RemoteTouchScreen::MINPRESSURE) {
+        _lastX = -1;   // reset on touch up so next touch is always fresh
+        _lastY = -1;
+        return;
+    }
+
+    // Only act if position changed — prevents redundant draws and
+    // selectColor() being called repeatedly while finger is held down
+    if (p.x == _lastX && p.y == _lastY) return;
+    _lastX = p.x;
+    _lastY = p.y;
 
     // Bottom swatch/clear row
     if (p.y >= DISP_H - SWATCH_H) {
