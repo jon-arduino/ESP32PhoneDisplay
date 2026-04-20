@@ -143,30 +143,44 @@ void loop()
         return;
     }
 
-    TSPoint p = ts.getPoint();
+    // Drain all queued touch points — handles WiFi radio burst recovery.
+    // All points accumulated since last loop() are drawn in order (FIFO).
+    // One flush after all points = efficient, no per-point TCP write.
+    bool drew = false;
+    while (ts.available()) {
+        TSPoint p = ts.getQueuedPoint();
 
-    // if touch is released — reset last position so next touch is always fresh
-    if (p.z <= RemoteTouchScreen::MINPRESSURE) {
-        _lastX = -1;   // reset on touch up so next touch is always fresh
-        _lastY = -1;
-        return;
+        if (ts.queueOverflows() > 0) {
+           Serial.printf("[Touch] queue overflows: %u\n", ts.queueOverflows());
+           ts.resetOverflows();
+        }
+
+        if (p.z <= RemoteTouchScreen::MINPRESSURE) {
+            // Touch up — reset position so next touch starts fresh
+            _lastX = -1;
+            _lastY = -1;
+            continue;
+        }
+
+        // Skip duplicate positions
+        if (p.x == _lastX && p.y == _lastY) continue;
+        _lastX = p.x;
+        _lastY = p.y;
+
+        // Bottom swatch/clear row — only act once per touch position
+        if (p.y >= DISP_H - SWATCH_H) {
+            selectColor(p.x);
+            continue;
+        }
+
+        // Drawing area
+        if (p.y > 24) {
+            display.fillCircle(p.x, p.y, PENRADIUS, currentColor);
+            drew = true;
+        }
     }
 
-    // Only act if position changed — prevents redundant draws and
-    // selectColor() being called repeatedly while finger is held down
-    if (p.x == _lastX && p.y == _lastY) return;
-    _lastX = p.x;
-    _lastY = p.y;
-
-    // Bottom swatch/clear row
-    if (p.y >= DISP_H - SWATCH_H) {
-        selectColor(p.x);
-        return;
-    }
-
-    // Drawing area (below header, above swatches)
-    if (p.y > 24) {
-        display.fillCircle(p.x, p.y, PENRADIUS, currentColor);
-        display.flush();
-    }
+    // Single flush after draining entire queue
+    if (drew) display.flush();
 }
+

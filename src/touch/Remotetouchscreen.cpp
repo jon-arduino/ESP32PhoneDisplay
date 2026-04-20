@@ -17,12 +17,10 @@ RemoteTouchScreen::RemoteTouchScreen(GraphicsTransport &transport)
 
 void RemoteTouchScreen::begin(uint8_t mode, uint16_t interval_ms)
 {
-    // Wire back-channel callback — fires on BLE/WiFi receive task
     _transport.onTouch([this](uint8_t cmd, int16_t x, int16_t y, uint8_t z) {
         handleTouch(cmd, x, y, z);
     });
 
-    // Send TOUCH_BEGIN to iPhone
     GfxTouchBeginPayload p;
     p.mode             = mode;
     p.move_interval_ms = interval_ms;
@@ -35,7 +33,10 @@ void RemoteTouchScreen::end()
 {
     sendCommand(GFX_CMD_TOUCH_END, nullptr, 0);
     _active = false;
-    _point.x = 0; _point.y = 0; _point.z = 0;
+    portENTER_CRITICAL(&_mux);
+    _current = TSPoint();
+    clearQueue();
+    portEXIT_CRITICAL(&_mux);
 }
 
 void RemoteTouchScreen::setDelay(uint16_t interval_ms)
@@ -45,37 +46,95 @@ void RemoteTouchScreen::setDelay(uint16_t interval_ms)
     sendCommand(GFX_CMD_TOUCH_DELAY, &p, sizeof(p));
 }
 
-// ── Polling API ───────────────────────────────────────────────────────────────
+// ── Standard API ──────────────────────────────────────────────────────────────
 
-TSPoint RemoteTouchScreen::getPoint() const
+// Returns newest point and discards path queue.
+// Standard UI/game pattern — no path history needed.
+TSPoint RemoteTouchScreen::getPoint()
 {
-    TSPoint p;
-    p.x = _point.x;
-    p.y = _point.y;
-    p.z = _point.z;
+    portENTER_CRITICAL(&_mux);
+    TSPoint p = _current;
+    clearQueue();   // discard path history — caller wants current state only
+    portEXIT_CRITICAL(&_mux);
     return p;
 }
 
 bool RemoteTouchScreen::touched() const
 {
-    return _point.z > MINPRESSURE;
+    return _current.z > MINPRESSURE;
 }
 
-// ── Internal back-channel handler ─────────────────────────────────────────────
+// ── Path API ──────────────────────────────────────────────────────────────────
 
+uint8_t RemoteTouchScreen::available() const
+{
+    portENTER_CRITICAL(const_cast<portMUX_TYPE*>(&_mux));
+    uint8_t count = (_qHead - _qTail) % QUEUE_SIZE;
+    portEXIT_CRITICAL(const_cast<portMUX_TYPE*>(&_mux));
+    return count;
+}
+
+TSPoint RemoteTouchScreen::getQueuedPoint()
+{
+    portENTER_CRITICAL(&_mux);
+    TSPoint p;
+    if (_qHead != _qTail) {
+        p = _queue[_qTail];
+        _qTail = (_qTail + 1) % QUEUE_SIZE;
+    }
+    portEXIT_CRITICAL(&_mux);
+    return p;
+}
+
+// ── Diagnostics ───────────────────────────────────────────────────────────────
+
+uint16_t RemoteTouchScreen::queueOverflows() const { return _overflows; }
+void     RemoteTouchScreen::resetOverflows()        { _overflows = 0;   }
+
+// ── Internal ──────────────────────────────────────────────────────────────────
+
+// Called from BLE/WiFi receive task (core 0) — protected by spinlock.
 void RemoteTouchScreen::handleTouch(uint8_t cmd, int16_t x, int16_t y, uint8_t z)
 {
+    portENTER_CRITICAL(&_mux);
+
     switch (cmd) {
         case BC_CMD_TOUCH_DOWN:
-        case BC_CMD_TOUCH_MOVE:
-            _point.x = x; _point.y = y; _point.z = (int16_t)z;
+        case BC_CMD_TOUCH_MOVE: {
+            TSPoint p(x, y, (int16_t)z);
+            _current = p;
+            enqueue(p);
             break;
+        }
         case BC_CMD_TOUCH_UP:
-            _point.x = 0; _point.y = 0; _point.z = 0;
+            _current = TSPoint();   // z=0, finger lifted
+            // Enqueue a zero-z point so path readers know touch ended
+            enqueue(TSPoint(x, y, 0));
             break;
         default:
             break;
     }
+
+    portEXIT_CRITICAL(&_mux);
+}
+
+// Must be called with _mux held.
+void RemoteTouchScreen::enqueue(const TSPoint &p)
+{
+    uint8_t nextHead = (_qHead + 1) % QUEUE_SIZE;
+    if (nextHead == _qTail) {
+        // Queue full — drop oldest point, advance tail
+        _qTail = (_qTail + 1) % QUEUE_SIZE;
+        _overflows++;
+    }
+    _queue[_qHead] = p;
+    _qHead = nextHead;
+}
+
+// Must be called with _mux held.
+void RemoteTouchScreen::clearQueue()
+{
+    _qHead = _qTail = 0;
 }
 
 // ── Private ───────────────────────────────────────────────────────────────────
@@ -89,7 +148,7 @@ void RemoteTouchScreen::sendCommand(uint8_t cmd,
     const uint16_t len   = 1 + payloadLen;
     const uint16_t total = 3 + 1 + payloadLen;
 
-    if (total <= 64) {   // all touch commands are small
+    if (total <= 64) {
         uint8_t buf[64];
         buf[0] = MAGIC;
         putU16LE(&buf[1], len);
