@@ -92,7 +92,8 @@ public:
             // that WiFi is connected. Must be done before setPowerSave(false).
             if (_disablePowerSave && !_bleStopped) {
                 Serial.println("[Dual] Shutting down BLE for full WiFi performance");
-                NimBLEDevice::deinit(true);
+                _ble.stop();                  // kill drain task before deinit
+                NimBLEDevice::deinit(true);   // fully shut down NimBLE stack
                 _bleStopped = true;
                 _wifi.setPowerSave(false);
             }
@@ -180,7 +181,12 @@ public:
     uint32_t rttCount() const { return _wifi.rttCount(); }
     void     resetRttStats()  { _wifi.resetRttStats();   }
 
-    // ── WiFi power saving ─────────────────────────────────────────────────────
+    // ── BLE connection interval ───────────────────────────────────────────────
+    // Set before begin() or call on active connection to renegotiate.
+    // minMs/maxMs in milliseconds. iOS minimum: 15ms.
+    // Shorter = more responsive but more power consumption.
+    void setConnectionInterval(uint16_t minMs, uint16_t maxMs)  { _ble.setConnectionInterval(minMs, maxMs); }
+    void updateConnectionInterval(uint16_t minMs, uint16_t maxMs) { _ble.updateConnectionInterval(minMs, maxMs); }
     // setPowerSave(false) — when WiFi connects, fully shuts down BLE stack
     // and disables WiFi modem sleep for maximum WiFi performance.
     // This is a one-way operation — BLE cannot be restarted without a reboot.

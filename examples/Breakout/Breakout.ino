@@ -1,11 +1,11 @@
 // Breakout — classic breakout game ported to ESP32PhoneDisplay
 //
 // Original sketch by Enrique Albertos (public domain)
-// Ported to ESP32PhoneDisplay using the Compat layer and iPhoneTouchScreen.
+// Ported to ESP32PhoneDisplay using the Compat layer and RemoteTouchScreen.
 //
 // Porting changes summary:
 //   - Adafruit_TFTLCD + hardware init  → ESP32PhoneDisplay_Compat + transport.begin()
-//   - TouchScreen (resistive, ADC)     → iPhoneTouchScreen (back-channel, virtual coords)
+//   - TouchScreen (resistive, ADC)     → RemoteTouchScreen (back-channel, virtual coords)
 //   - ts.getPoint() coordinate mapping → removed (iPhone sends display-space coords directly)
 //   - tft.reset() / readID() / begin() → transport.begin() + tft.begin()
 //   - Everything else unchanged
@@ -33,17 +33,25 @@
 #define DISP_W  240
 #define DISP_H  320
 
-// ── Demo mode ─────────────────────────────────────────────────────────────────
-// When DEMO_MODE is defined the paddle tracks the ball automatically.
-// Useful for testing rendering without needing working touch input.
-// Comment out to play with touch control.
-#define DEMO_MODE
+// ── Touch interval ────────────────────────────────────────────────────────────
+// How often iPhone sends TOUCH_MOVE events. Match to game frame rate (~25ms).
+// Lower = more responsive but more BLE back-channel traffic.
+#define TOUCH_INTERVAL_MS    30
+
+// ── BLE connection interval ───────────────────────────────────────────────────
+// Requested connection interval in ms. iOS minimum is 15ms.
+// Lower = faster display updates and touch response, more power consumption.
+#define BLE_INTERVAL_MIN_MS  15
+#define BLE_INTERVAL_MAX_MS  15
+
+// ── Debug output ──────────────────────────────────────────────────────────────
+#define DEBUG  false   // set true to enable loop timing and touch diagnostics
 
 BleTransport              transport;
 ESP32PhoneDisplay_Compat  tft(transport, DISP_W, DISP_H);
-iPhoneTouchScreen         ts;
+RemoteTouchScreen         ts(transport);
 
-// ── Game types — must be defined before forward declarations ──────────────────
+// ── Game types ────────────────────────────────────────────────────────────────
 #define SCORE_SIZE   30
 #define GAMES_NUMBER 16
 
@@ -122,21 +130,29 @@ int             level;
 const uint8_t   BIT_MASK[]      = {0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80};
 uint8_t         pointsForRow[]  = {7,7,5,5,3,3,1,1};
 
-// ── Reconnect flag (set from NimBLE task, consumed in loop) ───────────────────
 static volatile bool drawPending = false;
+static volatile bool _autoPlay   = false;  // T1=autoplay, T2=player
 
-// ── setup() ──────────────────────────────────────────────────────────────────
+// ── setup() ───────────────────────────────────────────────────────────────────
 
 void setup()
 {
     Serial.begin(115200);
-uint32_t t = millis();
+    uint32_t t = millis();
     while (!Serial && (millis() - t) < 3000) { delay(10); }
     Serial.println("[Breakout] Booting...");
 
-    transport.onTouch([](uint8_t cmd, int16_t x, int16_t y) {
-        ts.handleTouch(cmd, x, y);
+    transport.onKey([](uint8_t key) {
+        if (key == '1') {
+            _autoPlay = true;
+            Serial.println("[Breakout] Auto-play ON");
+        } else if (key == '2') {
+            _autoPlay = false;
+            Serial.println("[Breakout] Player mode ON");
+        }
     });
+
+    transport.setConnectionInterval(BLE_INTERVAL_MIN_MS, BLE_INTERVAL_MAX_MS);
 
     transport.onSubscribed([](bool ready) {
         if (ready) drawPending = true;
@@ -150,11 +166,12 @@ uint32_t t = millis();
 
     gameSize = {0, 0, DISP_W, DISP_H};
     level = 0;
-    tft.begin();    // send BEGIN command — tells iPhone the virtual display size
+    tft.begin();    // send BEGIN — tells iPhone the virtual display size
+    ts.begin(TOUCH_MODE_RESISTIVE, TOUCH_INTERVAL_MS);
     newGame(&games[0], &state);
 }
 
-// ── loop() ───────────────────────────────────────────────────────────────────
+// ── loop() ────────────────────────────────────────────────────────────────────
 
 int selection = -1;
 
@@ -166,13 +183,16 @@ void loop()
         level = 0;
         state.score = 0;
         tft.begin();    // re-send BEGIN so iPhone re-syncs display dimensions
+        ts.begin(TOUCH_MODE_RESISTIVE, TOUCH_INTERVAL_MS);
         newGame(&games[0], &state);
         return;
     }
 
-    selection = readUiSelection(game, &state, selection);
-    drawPlayer(game, &state);
+    uint32_t t0 = millis();
+
+    // Read touch FIRST — every iteration, before any blocking BLE sends
     state.playerxold = state.playerx;
+    selection = readUiSelection(game, &state, selection);
 
     int maxV = (1 << game->exponent) - 1;
     if (abs(state.vely) > maxV) state.vely = maxV * ((state.vely > 0) - (state.vely < 0));
@@ -184,9 +204,15 @@ void loop()
     checkBallCollisions(game, &state, state.ballx >> game->exponent, state.bally >> game->exponent);
     checkBallExit(game,      &state, state.ballx >> game->exponent, state.bally >> game->exponent);
 
+    // Draw ball and player together — both go into stream buffer before
+    // drain task wakes, so they're batched into one BLE notification
     drawBall(state.ballx >> game->exponent, state.bally >> game->exponent,
              state.ballxold >> game->exponent, state.ballyold >> game->exponent,
              game->ballsize);
+
+    // Always redraw paddle — covers ball artifacts, batched with ball draw
+    drawPlayer(game, &state);
+    state.playerxold = state.playerx;
 
     state.ballxold = state.ballx;
     state.ballyold = state.bally;
@@ -203,8 +229,17 @@ void loop()
         level = 0;
         newGame(&games[0], &state);
     }
-    delay(1);  // make sure you don't hit idle task watchdog
+    uint32_t t1 = millis();
+    uint32_t t2 = millis();
     tft.flush();
+    uint32_t t3 = millis();
+
+    static uint32_t _loopStart = 0;
+    uint32_t _loopTime = millis() - _loopStart;
+    if (DEBUG && _loopStart > 0 && _loopTime > 20)
+        Serial.printf("[Loop] total:%u physics:%u flush:%u\n",
+                      _loopTime, t1-t0, t3-t2);
+    _loopStart = millis();
 }
 
 // ── Game functions ────────────────────────────────────────────────────────────
@@ -217,13 +252,13 @@ void newGame(game_type* newGame, game_state_type* state)
     updateLives(game->lives, state->remainingLives);
     updateScore(state->score);
     setupWall(game, state);
-    tft.flush();        // send initial board to iPhone before blocking in touchToStart
+    tft.flush();
     touchToStart();
     clearDialog();
     updateLives(game->lives, state->remainingLives);
     updateScore(state->score);
     setupWall(game, state);
-    tft.flush();        // send final board state after "touch to start" is dismissed
+    tft.flush();
 }
 
 void setupStateSizes(game_type* game, game_state_type* state)
@@ -282,14 +317,12 @@ boolean noBricks(game_type* game, game_state_type* state)
 void drawPlayer(game_type* game, game_state_type* state)
 {
     tft.fillRect(state->playerx, state->bottom, game->playerwidth, game->playerheight, YELLOW);
-    if (state->playerx != state->playerxold) {
-        if (state->playerx < state->playerxold)
-            tft.fillRect(state->playerx + game->playerwidth, state->bottom,
-                         abs(state->playerx - state->playerxold), game->playerheight, backgroundColor);
-        else
-            tft.fillRect(state->playerxold, state->bottom,
-                         abs(state->playerx - state->playerxold), game->playerheight, backgroundColor);
-    }
+    if (state->playerx < state->playerxold)
+        tft.fillRect(state->playerx + game->playerwidth, state->bottom,
+                     abs(state->playerx - state->playerxold), game->playerheight, backgroundColor);
+    else
+        tft.fillRect(state->playerxold, state->bottom,
+                     abs(state->playerx - state->playerxold), game->playerheight, backgroundColor);
 }
 
 void drawBall(int x, int y, int xold, int yold, int ballsize)
@@ -352,8 +385,9 @@ int checkCornerCollision(game_type* game, game_state_type* state, uint16_t x, ui
 void hitBrick(game_state_type* state, int xBrick, int yRow)
 {
     state->score += pointsForRow[yRow];
-    drawBrick(state, xBrick, yRow, WHITE); tft.flush(); delay(16);
-    drawBrick(state, xBrick, yRow, BLUE);  tft.flush(); delay(8);
+    // Flash white then blue then gone across natural frame boundaries
+    drawBrick(state, xBrick, yRow, WHITE);
+    drawBrick(state, xBrick, yRow, BLUE);
     drawBrick(state, xBrick, yRow, backgroundColor);
     unsetBrick(state->wallState, xBrick, yRow);
     updateScore(state->score);
@@ -417,41 +451,56 @@ void clearDialog()
 }
 
 // ── Touch input ───────────────────────────────────────────────────────────────
-// iPhone sends coordinates already mapped to virtual display space.
-// No ADC calibration needed — use p.x and p.y directly.
 
 int readUiSelection(game_type* game, game_state_type* state, int16_t lastSelected)
 {
-    TSPoint tp = ts.getPoint();
-    if (tp.z > iPhoneTouchScreen::MINPRESSURE) {
-        state->playerx += (tp.x > tft.width() / 2) ? 4 : -4;
+    if (_autoPlay) {
+        // Auto-play: paddle tracks ball automatically
+        state->playerx = (state->ballx >> game->exponent) - game->playerwidth / 2;
         if (state->playerx >= tft.width() - game->playerwidth)
             state->playerx = tft.width() - game->playerwidth;
         if (state->playerx < 0) state->playerx = 0;
         return 1;
     }
-#ifdef DEMO_MODE
-    // No touch — auto-track the ball for demo/rendering testing
-    state->playerx = (state->ballx >> game->exponent) - game->playerwidth / 2;
-    if (state->playerx >= tft.width() - game->playerwidth)
-        state->playerx = tft.width() - game->playerwidth;
-    if (state->playerx < 0) state->playerx = 0;
-#endif
+
+    // Diagnostic: count new points that arrived from iPhone since last loop
+    {
+        int newPoints = 0;
+        TSPoint last;
+        while (ts.available()) {
+            last = ts.getQueuedPoint();
+            newPoints++;
+        }
+        if (DEBUG && newPoints > 0)
+            Serial.printf("[Touch] %d new pts x=%d y=%d\n",
+                          newPoints, last.x, last.y);
+    }
+
+    // Player mode: paddle centers on touch x position
+    TSPoint tp = ts.getPoint();
+    if (tp.z > RemoteTouchScreen::MINPRESSURE) {
+        int16_t newX = tp.x - game->playerwidth / 2;
+        if (newX < 0) newX = 0;
+        if (newX >= tft.width() - game->playerwidth)
+            newX = tft.width() - game->playerwidth;
+        state->playerx = newX;
+        return 1;
+    }
     return -1;
 }
 
 int waitForTouch()
 {
-    TSPoint tp = ts.getPoint();
-    // Treat a reconnect as a touch so blocking loops exit cleanly on reconnect
     if (drawPending) return 1;
-#ifdef DEMO_MODE
-    // In demo mode, auto-advance after 2 seconds so the game starts without touch
-    static uint32_t demoWaitStart = 0;
-    if (demoWaitStart == 0) demoWaitStart = millis();
-    if (millis() - demoWaitStart >= 2000) { demoWaitStart = 0; return 1; }
-#endif
-    if (tp.z > iPhoneTouchScreen::MINPRESSURE) return 1;
+    if (_autoPlay) {
+        static uint32_t autoWaitStart = 0;
+        if (autoWaitStart == 0) autoWaitStart = millis();
+        if (millis() - autoWaitStart >= 2000) { autoWaitStart = 0; return 1; }
+        return -1;
+    }
+    while (ts.available()) {
+        TSPoint p = ts.getQueuedPoint();
+        if (p.z > RemoteTouchScreen::MINPRESSURE) return 1;
+    }
     return -1;
 }
-

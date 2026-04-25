@@ -21,6 +21,21 @@ public:
 
     void begin();
     void startAdvertising();
+    void stop();   // kills drain task — call before NimBLEDevice::deinit()
+
+    // ── Connection interval ───────────────────────────────────────────────────
+    // Set before begin() — applied automatically when iPhone connects.
+    // minMs/maxMs in milliseconds. BLE step size is 1.25ms.
+    // iOS minimum: 15ms. Shorter = more responsive but more power.
+    // Default: iOS-negotiated (~25ms).
+    void setConnectionInterval(uint16_t minMs, uint16_t maxMs)
+    {
+        _connIntervalMin = (uint16_t)(minMs / 1.25f);
+        _connIntervalMax = (uint16_t)(maxMs / 1.25f);
+    }
+
+    // Call on active connection to renegotiate interval immediately.
+    void updateConnectionInterval(uint16_t minMs, uint16_t maxMs);
 
     bool     canSend() const;
     uint16_t effectiveChunkSize() const;
@@ -55,6 +70,9 @@ private:
     NimBLEServer         *pServer  = nullptr;
     NimBLECharacteristic *pTxChar  = nullptr;
     NimBLECharacteristic *pRxChar  = nullptr;
+    uint16_t              _connHandle      = BLE_HS_CONN_HANDLE_NONE;
+    uint16_t              _connIntervalMin = 0;   // 0 = let iOS negotiate
+    uint16_t              _connIntervalMax = 0;
 
     bool     _connected        = false;
     bool     _notifySubscribed = false;

@@ -8,14 +8,45 @@ extern "C" int os_msys_num_free(void);
 //  NimBLE server callbacks
 // ─────────────────────────────────────────────────────────────────────────────
 
-void BleTransport::ServerCB::onConnect(NimBLEServer*, NimBLEConnInfo& connInfo)
+struct ConnUpdateArgs {
+    NimBLEServer *server;
+    uint16_t      connHandle;
+    uint16_t      minUnits;
+    uint16_t      maxUnits;
+};
+
+static void connUpdateTask(void *arg)
+{
+    auto *p = static_cast<ConnUpdateArgs*>(arg);
+    vTaskDelay(pdMS_TO_TICKS(1500));   // wait for iOS to be ready (~1s recommended)
+    p->server->updateConnParams(p->connHandle, p->minUnits, p->maxUnits, 0, 200);
+    Serial.printf("[BLE] Requested connection interval %u-%ums\n",
+                  (uint32_t)(p->minUnits * 1.25f),
+                  (uint32_t)(p->maxUnits * 1.25f));
+    delete p;
+    vTaskDelete(nullptr);
+}
+
+void BleTransport::ServerCB::onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo)
 {
     _owner->_connected        = true;
     _owner->_notifySubscribed = false;
+    _owner->_connHandle       = connInfo.getConnHandle();
     _owner->_bc.reset();
     Serial.println("[BLE] connected");
     Serial.print("[BLE] peer: ");
     Serial.println(connInfo.getAddress().toString().c_str());
+
+    // iOS needs ~1 second after connect before it will honour a connection
+    // parameter update request. Spawn a short-lived task to delay the call.
+    if (_owner->_connIntervalMin > 0) {
+        auto *args      = new ConnUpdateArgs();
+        args->server    = pServer;
+        args->connHandle = connInfo.getConnHandle();
+        args->minUnits  = _owner->_connIntervalMin;
+        args->maxUnits  = _owner->_connIntervalMax;
+        xTaskCreate(connUpdateTask, "ble_conn_upd", 2048, args, 1, nullptr);
+    }
 }
 
 void BleTransport::ServerCB::onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason)
@@ -24,6 +55,7 @@ void BleTransport::ServerCB::onDisconnect(NimBLEServer*, NimBLEConnInfo&, int re
     _owner->_notifySubscribed = false;
     _owner->_cccdNotify       = false;
     _owner->_cccdIndicate     = false;
+    _owner->_connHandle       = BLE_HS_CONN_HANDLE_NONE;
     _owner->_bc.reset();
 
     // Flush stream buffer so drain task doesn't send stale data on reconnect
@@ -148,6 +180,29 @@ void BleTransport::begin()
     );
 
     startAdvertising();
+}
+
+// Stop drain task — must be called before NimBLEDevice::deinit()
+// to prevent the drain task from accessing freed NimBLE resources.
+void BleTransport::stop()
+{
+    if (_drainTaskHandle != nullptr) {
+        vTaskDelete(_drainTaskHandle);
+        _drainTaskHandle = nullptr;
+    }
+}
+
+void BleTransport::updateConnectionInterval(uint16_t minMs, uint16_t maxMs)
+{
+    uint16_t minUnits = (uint16_t)(minMs / 1.25f);
+    uint16_t maxUnits = (uint16_t)(maxMs / 1.25f);
+    _connIntervalMin = minUnits;
+    _connIntervalMax = maxUnits;
+
+    if (pServer && _connHandle != BLE_HS_CONN_HANDLE_NONE) {
+        pServer->updateConnParams(_connHandle, minUnits, maxUnits, 0, 200);
+        Serial.printf("[BLE] Requesting connection interval %u-%ums\n", minMs, maxMs);
+    }
 }
 
 void BleTransport::startAdvertising()
