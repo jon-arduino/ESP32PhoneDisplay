@@ -1,5 +1,4 @@
 #include "BackChannelParser.h"
-#include "Protocol.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  feed — accumulate bytes and dispatch complete frames
@@ -10,13 +9,16 @@ void BackChannelParser::feed(const uint8_t *data, size_t len)
         uint8_t b = data[i];
 
         // Sync: discard bytes until we see BC_MAGIC at start of frame
-        if (_len == 0 && b != BC_MAGIC) continue;
+        if (_len == 0 && b != BC_MAGIC) {
+            _stats.syncErrors++;
+            continue;
+        }
 
         // Accumulate — guard against buffer overrun
         if (_len < BUF_SIZE) {
             _buf[_len++] = b;
         } else {
-            Serial.println("[BackChannel] Buffer overrun — resyncing");
+            _stats.overruns++;
             _len = 0;
             continue;
         }
@@ -30,7 +32,7 @@ void BackChannelParser::feed(const uint8_t *data, size_t len)
 
         // Validate: must have at least cmd byte, must fit in buffer
         if (frameLen < 1 || totalSize > BUF_SIZE) {
-            Serial.printf("[BackChannel] Invalid frameLen=%d — resyncing\n", frameLen);
+            _stats.invalidFrames++;
             _len = 0;
             continue;
         }
@@ -56,16 +58,17 @@ void BackChannelParser::dispatch(uint8_t cmd, const uint8_t *payload, size_t pay
     switch (cmd) {
 
         case BC_CMD_PONG:
+            _stats.pong++;
             if (_pongCallback) _pongCallback();
             break;
 
         case BC_CMD_KEY1:
-            Serial.println("[BackChannel] KEY1");
+            _stats.key1++;
             if (_keyCallback) _keyCallback('1');
             break;
 
         case BC_CMD_KEY2:
-            Serial.println("[BackChannel] KEY2");
+            _stats.key2++;
             if (_keyCallback) _keyCallback('2');
             break;
 
@@ -75,18 +78,19 @@ void BackChannelParser::dispatch(uint8_t cmd, const uint8_t *payload, size_t pay
                 int16_t x = (int16_t)((payload[1] << 8) | payload[0]);  // little-endian
                 int16_t y = (int16_t)((payload[3] << 8) | payload[2]);  // little-endian
                 uint8_t z = payload[4];  // BC_TOUCH_Z_CONTACT (128) from iPhone
+                _stats.touch++;
                 if (_touchCallback) _touchCallback(cmd, x, y, z);
             }
             break;
         }
 
         case BC_CMD_TOUCH_UP:
+            _stats.touch++;
             if (_touchCallback) _touchCallback(BC_CMD_TOUCH_UP, 0, 0, BC_TOUCH_Z_NONE);
             break;
 
         default:
-            Serial.printf("[BackChannel] Unknown cmd=0x%02X payloadLen=%d\n",
-                          cmd, (int)payloadLen);
+            _stats.unknownCmds++;
             break;
     }
 }

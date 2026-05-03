@@ -33,9 +33,7 @@ void BleTransport::ServerCB::onConnect(NimBLEServer* pServer, NimBLEConnInfo& co
     _owner->_notifySubscribed = false;
     _owner->_connHandle       = connInfo.getConnHandle();
     _owner->_bc.reset();
-    Serial.println("[BLE] connected");
-    Serial.print("[BLE] peer: ");
-    Serial.println(connInfo.getAddress().toString().c_str());
+    Serial.printf("[BLE] connected\n[BLE] peer: %s\n", connInfo.getAddress().toString().c_str());
 
     // iOS needs ~1 second after connect before it will honour a connection
     // parameter update request. Spawn a short-lived task to delay the call.
@@ -47,6 +45,15 @@ void BleTransport::ServerCB::onConnect(NimBLEServer* pServer, NimBLEConnInfo& co
         args->maxUnits  = _owner->_connIntervalMax;
         xTaskCreate(connUpdateTask, "ble_conn_upd", 2048, args, 1, nullptr);
     }
+}
+
+void BleTransport::ServerCB::onConnParamsUpdate(NimBLEConnInfo& connInfo)
+{
+    // conn_itvl is in 1.25ms units
+    float intervalMs = connInfo.getConnInterval() * 1.25f;
+    _owner->_connIntervalNegotiatedMs = intervalMs;
+    Serial.printf("[BLE] Connection interval negotiated: %.1fms\n", intervalMs);
+    if (_owner->_onConnInterval) _owner->_onConnInterval(intervalMs);
 }
 
 void BleTransport::ServerCB::onDisconnect(NimBLEServer*, NimBLEConnInfo&, int reason)
@@ -216,7 +223,7 @@ void BleTransport::startAdvertising()
     adv->setMinInterval(48);
     adv->setMaxInterval(160);
     adv->start();
-    Serial.println("[BLE] advertising started");
+    Serial.printf("[BLE] advertising started\n");
 }
 
 bool BleTransport::canSend() const
@@ -358,7 +365,7 @@ void BleTransport::runDrainLoop()
         // ── Wait for onStatus ─────────────────────────────────────────────────
         // onStatus fires when NimBLE has queued the packet to the controller.
         if (xSemaphoreTake(_txDone, pdMS_TO_TICKS(2000)) != pdTRUE) {
-            Serial.println("[BLE] onStatus timeout -- retrying");
+            Serial.printf("[BLE] onStatus timeout -- retrying\n");
             xSemaphoreGive(_txDone);
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;

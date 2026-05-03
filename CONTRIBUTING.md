@@ -1,36 +1,51 @@
-# Contributing to ESP32PhoneDisplay
+# Contributing
 
-Thank you for your interest in contributing. This document covers how to report bugs, request features, and submit code.
+## Reporting Issues
 
-## Reporting bugs
-
-Use the [Bug Report](.github/ISSUE_TEMPLATE/bug_report.md) template. Please include:
+Please include:
 - ESP32 board and Arduino core version
-- NimBLE-Arduino / AsyncTCP versions
+- NimBLE-Arduino version
+- iOS app version
+- Transport used (BLE / WiFi / Dual)
 - Minimal sketch that reproduces the issue
-- Serial console output
-- iPhone app version
+- Serial output if relevant
 
-## Requesting features
+## Development Notes
 
-Use the [Feature Request](.github/ISSUE_TEMPLATE/feature_request.md) template. Describe the use case — what are you trying to build?
+### Threading Model
 
-## Submitting code
+The library uses two cores:
 
-1. Fork the repo and create a branch from `main`
-2. Keep changes focused — one feature or fix per PR
-3. Test on real hardware (ESP32 + iPhone app)
-4. Run arduino-lint locally if possible: `arduino-lint --library-manager submit`
-5. Update `CHANGELOG.md` under `[Unreleased]`
-6. Submit the PR with a clear description of what changed and why
+- **Core 1** — Arduino `loop()`, all drawing commands, `RemoteTouchScreen::getPoint()`
+- **Core 0** — NimBLE host task, BLE drain task, WiFi background task, all transport callbacks
 
-## Code style
+### Serial Logging from Callbacks
 
-- C++11, Arduino-compatible
-- No dynamic allocation in hot paths (send/receive loops)
-- Keep `GraphicsTransport` and `Protocol.h` free of BLE/WiFi dependencies
-- New transport implementations go in `src/transport/`
+BLE callbacks run on core 0. `Serial.printf()` is unreliable from this context due to NimBLE critical sections masking the UART TX interrupt (see ESP-IDF flash concurrency documentation). Use `ESP_DRAM_LOGx` for reliable logging from callbacks, or defer prints to `loop()` via volatile flags.
 
-## Protocol changes
+### Adding a New Transport
 
-Changes to `Protocol.h` require coordinated updates to the iPhone app. Open an issue first to discuss before implementing — protocol changes affect all users.
+Subclass `GraphicsTransport` and implement:
+
+```cpp
+void send(const uint8_t *data, uint16_t len) override;
+bool canSend() const override;
+```
+
+Optionally implement `flush()`, `reset()`, and `onTouch()`. See `examples/CustomTransport` for a complete example.
+
+### Protocol
+
+GFX command opcodes and payload structures are in `src/GraphicsProtocol.h`. Back-channel (iPhone → ESP32) framing is in `src/Protocol.h`. The iOS app must implement the same protocol.
+
+### Testing
+
+Flash `examples/BandwidthTest` to measure transport throughput. Flash `examples/SerialTest` to verify protocol encoding without needing the iOS app.
+
+## Code Style
+
+- C++11
+- 4-space indentation
+- `snake_case` for member variables with `_` prefix
+- `camelCase` for methods
+- All public API documented in header comments

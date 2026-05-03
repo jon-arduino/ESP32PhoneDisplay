@@ -15,9 +15,10 @@
 #include <transport/BleTransport.h>
 #include <touch/RemoteTouchScreen.h>
 
+
 // ── Tuning ────────────────────────────────────────────────────────────────────
 #define FRAME_MS             33    // target frame time (~30fps)
-#define SPEED_MULTIPLIER     3.5f  // multiply ball speed — tune until it feels right
+#define SPEED_MULTIPLIER     5.0f  // multiply ball speed — tune until it feels right
 #define TOUCH_INTERVAL_MS    30    // iPhone MOVE event rate
 #define BLE_INTERVAL_MIN_MS  15    // BLE connection interval min
 #define BLE_INTERVAL_MAX_MS  30    // BLE connection interval max
@@ -134,8 +135,13 @@ BrickFlash      flash;
 const uint8_t BIT_MASK[]     = {0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80};
 uint8_t       pointsForRow[] = {7,7,5,5,3,3,1,1};
 
-static volatile bool drawPending = false;
-static volatile bool _autoPlay   = false;
+static volatile bool  drawPending    = false;
+static volatile bool  _autoPlay      = false;
+static volatile int   _autoPlayMsg   = 0;    // 1=ON, 2=OFF — printed from loop()
+static volatile float _connIntervalMs = 0;   // >0 = new interval to print from loop()
+static volatile uint32_t _appKey1 = 0;       // incremented in onKey callback
+static volatile uint32_t _appKey2 = 0;
+
 
 // ── setup() ───────────────────────────────────────────────────────────────────
 
@@ -148,10 +154,13 @@ void setup()
 
     transport.setConnectionInterval(BLE_INTERVAL_MIN_MS, BLE_INTERVAL_MAX_MS);
 
+    transport.onConnInterval([](float ms) {
+        _connIntervalMs = ms;   // printed from loop() to avoid dual-core Serial interleave
+    });
+
     transport.onKey([](uint8_t key) {
-        Serial.printf("[Game] Key received: %c\n", key);
-        if      (key == '1') { _autoPlay = true;  Serial.println("[Game] Auto-play ON");  }
-        else if (key == '2') { _autoPlay = false; Serial.println("[Game] Player mode ON"); }
+        if      (key == '1') { _autoPlay = true;  _autoPlayMsg = 1; _appKey1++; }
+        else if (key == '2') { _autoPlay = false; _autoPlayMsg = 2; _appKey2++; }
     });
 
     transport.onSubscribed([](bool ready) {
@@ -178,6 +187,29 @@ int selection = -1;
 void loop()
 {
     uint32_t frameStart = millis();
+
+    // Print messages from loop() — avoids dual-core Serial interleave
+    if (_autoPlayMsg == 1) { Serial.println("[Game] Auto-play ON");  _autoPlayMsg = 0; }
+    if (_autoPlayMsg == 2) { Serial.println("[Game] Player mode ON"); _autoPlayMsg = 0; }
+    if (_connIntervalMs > 0) { Serial.printf("[BLE] Interval: %.1fms\n", _connIntervalMs); _connIntervalMs = 0; }
+
+    // Print BC stats when key counts change.
+    // bc counts (s.key1/2) = incremented in dispatch() on core 0.
+    // app counts (_appKey1/2) = incremented in _keyCallback on core 0,
+    //   same call stack as dispatch(). Should ALWAYS match bc counts.
+    //   A mismatch means _keyCallback didn't fire despite dispatch() running.
+    static uint32_t lastKey1 = 0, lastKey2 = 0;
+    auto s = transport.bcStats();
+      // Serial.printf("[BC-raw] k1=%u k2=%u\n", s.key1, s.key2);  // temporary
+    if (s.key1 != lastKey1 || s.key2 != lastKey2) {
+        bool mismatch = (s.key1 != (uint32_t)_appKey1 || s.key2 != (uint32_t)_appKey2);
+        Serial.printf("[BC] K1=%u/%u K2=%u/%u touch=%u sync=%u overrun=%u invalid=%u unknown=%u%s\n",
+                      s.key1, (uint32_t)_appKey1, s.key2, (uint32_t)_appKey2,
+                      s.touch, s.syncErrors, s.overruns, s.invalidFrames, s.unknownCmds,
+                      mismatch ? " *** CB MISMATCH ***" : "");
+        lastKey1 = s.key1;
+        lastKey2 = s.key2;
+    }
 
     // Handle reconnect
     if (drawPending) {

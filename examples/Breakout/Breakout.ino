@@ -152,7 +152,7 @@ void setup()
         }
     });
 
-    transport.setConnectionInterval(BLE_INTERVAL_MIN_MS, BLE_INTERVAL_MAX_MS);
+    // transport.setConnectionInterval(BLE_INTERVAL_MIN_MS, BLE_INTERVAL_MAX_MS);
 
     transport.onSubscribed([](bool ready) {
         if (ready) drawPending = true;
@@ -229,6 +229,7 @@ void loop()
         level = 0;
         newGame(&games[0], &state);
     }
+    delay(5);  // small delay to slow down game play
     uint32_t t1 = millis();
     uint32_t t2 = millis();
     tft.flush();

@@ -185,8 +185,10 @@ public:
     // Set before begin() or call on active connection to renegotiate.
     // minMs/maxMs in milliseconds. iOS minimum: 15ms.
     // Shorter = more responsive but more power consumption.
-    void setConnectionInterval(uint16_t minMs, uint16_t maxMs)  { _ble.setConnectionInterval(minMs, maxMs); }
-    void updateConnectionInterval(uint16_t minMs, uint16_t maxMs) { _ble.updateConnectionInterval(minMs, maxMs); }
+    void  setConnectionInterval(uint16_t minMs, uint16_t maxMs)    { _ble.setConnectionInterval(minMs, maxMs); }
+    void  updateConnectionInterval(uint16_t minMs, uint16_t maxMs) { _ble.updateConnectionInterval(minMs, maxMs); }
+    float connIntervalMs() const                                    { return _ble.connIntervalMs(); }
+    void  onConnInterval(std::function<void(float)> cb)            { _ble.onConnInterval(cb); }
     // setPowerSave(false) — when WiFi connects, fully shuts down BLE stack
     // and disables WiFi modem sleep for maximum WiFi performance.
     // This is a one-way operation — BLE cannot be restarted without a reboot.

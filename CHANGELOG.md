@@ -17,3 +17,40 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - `RemoteTouchScreen` — back-channel touch input compatible with Adafruit_TouchScreen API
 - Binary command protocol — single compact command per GFX operation, no pixel decomposition
 - Examples: BLE_HelloWorld, WiFi_HelloWorld, BLE_Telemetry, CompatLayer, CustomTransport
+
+
+# Changelog
+
+## 1.0.0 — 2026-04-30
+
+Initial public release.
+
+### Core
+- `ESP32PhoneDisplay` — Adafruit GFX–compatible drawing API over any transport
+- `ESP32PhoneDisplay_Compat` — drop-in replacement for Adafruit_TFTLCD
+- `GraphicsTransport` — abstract base for custom transport implementations
+
+### Transports
+- `BleTransport` — NimBLE-based BLE transport with 8KB stream buffer and drain task
+- `WiFiTransport` — AsyncTCP-based WiFi transport with ping/pong heartbeat and RTT stats
+- `DualTransport` — simultaneous BLE + WiFi with automatic switching
+
+### Touch
+- `RemoteTouchScreen` — Adafruit_TouchScreen–compatible touch via iPhone back-channel
+- 16-entry FIFO touch queue with overflow diagnostics
+- Standard API (`getPoint`) and path API (`getQueuedPoint`) for drawing apps
+- Configurable MOVE event throttle rate
+
+### BLE
+- Connection interval API — `setConnectionInterval()`, `updateConnectionInterval()`
+- `connIntervalMs()` — query actual negotiated interval
+- `onConnInterval()` — callback on interval change
+- 1.5s deferred interval request (iOS settling time)
+- `BackChannelParser::Stats` — cumulative diagnostic counters
+
+### Examples
+- `BLE_HelloWorld`, `BLE_TouchButtons`, `BLE_TouchPaint`, `BLE_Telemetry`
+- `WiFi_HelloWorld`, `DualTransport_TouchPaint`, `BandwidthTest`
+- `Breakout` — classic Breakout ported from Adafruit_TFTLCD (Enrique Albertos, public domain)
+- `Breakout_II` — fixed 30fps Breakout with speed multiplier and brick flash state machine
+- `CompatLayer`, `CustomTransport`, `SerialTest`

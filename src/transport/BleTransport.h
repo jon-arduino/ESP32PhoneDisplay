@@ -34,6 +34,12 @@ public:
         _connIntervalMax = (uint16_t)(maxMs / 1.25f);
     }
 
+    // Returns the actual negotiated connection interval in ms (0 if not yet known)
+    float connIntervalMs() const { return _connIntervalNegotiatedMs; }
+
+    // Callback fired when iOS accepts or changes the connection interval
+    void onConnInterval(std::function<void(float intervalMs)> cb) { _onConnInterval = cb; }
+
     // Call on active connection to renegotiate interval immediately.
     void updateConnectionInterval(uint16_t minMs, uint16_t maxMs);
 
@@ -58,6 +64,10 @@ public:
     void onTouch(std::function<void(uint8_t, int16_t, int16_t, uint8_t)> cb) override { _bc.onTouch(cb); }
     void onSubscribed(std::function<void(bool)> cb) { _subscribedCallback = cb; }
 
+    // Back-channel parser diagnostics
+    BackChannelParser::Stats bcStats() const { return _bc.getStats(); }
+    void resetBcStats()                      { _bc.resetStats(); }
+
     // RX
     bool   hasRxData() const;
     size_t readRx(uint8_t *dst, size_t maxLen);
@@ -71,8 +81,10 @@ private:
     NimBLECharacteristic *pTxChar  = nullptr;
     NimBLECharacteristic *pRxChar  = nullptr;
     uint16_t              _connHandle      = BLE_HS_CONN_HANDLE_NONE;
-    uint16_t              _connIntervalMin = 0;   // 0 = let iOS negotiate
-    uint16_t              _connIntervalMax = 0;
+    uint16_t              _connIntervalMin          = 0;   // 0 = let iOS negotiate
+    uint16_t              _connIntervalMax          = 0;
+    float                 _connIntervalNegotiatedMs = 0;   // actual negotiated interval
+    std::function<void(float)> _onConnInterval;
 
     bool     _connected        = false;
     bool     _notifySubscribed = false;
@@ -115,6 +127,7 @@ private:
         explicit ServerCB(BleTransport *o) : _owner(o) {}
         void onConnect(NimBLEServer*, NimBLEConnInfo&) override;
         void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override;
+        void onConnParamsUpdate(NimBLEConnInfo&) override;
         void onMTUChange(uint16_t mtu, NimBLEConnInfo&) override;
     private:
         BleTransport *_owner;
