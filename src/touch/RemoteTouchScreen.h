@@ -63,6 +63,10 @@ public:
     // Use for UI and games where current position is all that matters.
     TSPoint getPoint();
 
+    // Returns true if touch reporting is active (begin() succeeded).
+    // False if begin() was called before transport was connected.
+    bool isActive() const { return _active; }
+
     // Returns true if finger is currently down.
     bool touched() const;
 

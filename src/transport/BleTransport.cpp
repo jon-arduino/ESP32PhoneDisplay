@@ -9,20 +9,27 @@ extern "C" int os_msys_num_free(void);
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct ConnUpdateArgs {
+    BleTransport *owner;
     NimBLEServer *server;
     uint16_t      connHandle;
     uint16_t      minUnits;
     uint16_t      maxUnits;
 };
 
-static void connUpdateTask(void *arg)
+void connUpdateTask(void *arg)
 {
     auto *p = static_cast<ConnUpdateArgs*>(arg);
     vTaskDelay(pdMS_TO_TICKS(1500));   // wait for iOS to be ready (~1s recommended)
-    p->server->updateConnParams(p->connHandle, p->minUnits, p->maxUnits, 0, 200);
-    Serial.printf("[BLE] Requested connection interval %u-%ums\n",
-                  (uint32_t)(p->minUnits * 1.25f),
-                  (uint32_t)(p->maxUnits * 1.25f));
+
+    // Only update if still connected with the same connection handle.
+    // Guards against disconnect during the 1.5s wait window.
+    if (p->owner->canSend() && p->owner->_connHandle == p->connHandle) {
+        p->server->updateConnParams(p->connHandle, p->minUnits, p->maxUnits, 0, 200);
+        Serial.printf("[BLE] Requested connection interval %u-%ums\n",
+                      (uint32_t)(p->minUnits * 1.25f),
+                      (uint32_t)(p->maxUnits * 1.25f));
+    }
+    p->owner->_connUpdateTaskHandle = nullptr;
     delete p;
     vTaskDelete(nullptr);
 }
@@ -38,12 +45,14 @@ void BleTransport::ServerCB::onConnect(NimBLEServer* pServer, NimBLEConnInfo& co
     // iOS needs ~1 second after connect before it will honour a connection
     // parameter update request. Spawn a short-lived task to delay the call.
     if (_owner->_connIntervalMin > 0) {
-        auto *args      = new ConnUpdateArgs();
-        args->server    = pServer;
+        auto *args       = new ConnUpdateArgs();
+        args->owner      = _owner;
+        args->server     = pServer;
         args->connHandle = connInfo.getConnHandle();
-        args->minUnits  = _owner->_connIntervalMin;
-        args->maxUnits  = _owner->_connIntervalMax;
-        xTaskCreate(connUpdateTask, "ble_conn_upd", 2048, args, 1, nullptr);
+        args->minUnits   = _owner->_connIntervalMin;
+        args->maxUnits   = _owner->_connIntervalMax;
+        xTaskCreate(connUpdateTask, "ble_conn_upd", 2048, args, 1,
+                    &_owner->_connUpdateTaskHandle);
     }
 }
 
@@ -64,6 +73,15 @@ void BleTransport::ServerCB::onDisconnect(NimBLEServer*, NimBLEConnInfo&, int re
     _owner->_cccdIndicate     = false;
     _owner->_connHandle       = BLE_HS_CONN_HANDLE_NONE;
     _owner->_bc.reset();
+
+    // Cancel pending connection interval update task if still waiting.
+    // The task checks _connected before calling updateConnParams so this
+    // is belt-and-suspenders — the task would no-op anyway, but cancelling
+    // it frees the stack sooner.
+    if (_owner->_connUpdateTaskHandle != nullptr) {
+        vTaskDelete(_owner->_connUpdateTaskHandle);
+        _owner->_connUpdateTaskHandle = nullptr;
+    }
 
     // Flush stream buffer so drain task doesn't send stale data on reconnect
     xStreamBufferReset(_owner->_txStream);
@@ -123,9 +141,6 @@ void BleTransport::RxCharCB::onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo
     std::string v = pChar->getValue();
     size_t n = v.size();
     _owner->_bc.feed(reinterpret_cast<const uint8_t*>(v.data()), n);
-    if (n > RX_BUF_SIZE) n = RX_BUF_SIZE;
-    memcpy(_owner->rxBuf, v.data(), n);
-    _owner->rxLen = n;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,12 +333,16 @@ void BleTransport::runDrainLoop()
         if (pendingN == 0) {
             uint16_t chunkSize = effectiveChunkSize();
 
-            // 5ms timeout -- idle flush: partial buffers are always delivered
-            // within 5ms even if less than one MTU of data is waiting.
-            pendingN = xStreamBufferReceive(_txStream, chunk, chunkSize,
-                                            pdMS_TO_TICKS(5));
+            // Wait up to 5ms for data, or wake immediately if flush() signals.
+            // ulTaskNotifyTake resets the notification count on exit.
+            // This allows flush() to force an immediate send rather than
+            // waiting for the 5ms idle timeout.
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5));
+
+            // Non-blocking read — if notified early, grab whatever is there.
+            pendingN = xStreamBufferReceive(_txStream, chunk, chunkSize, 0);
             if (pendingN == 0) {
-                // Nothing in buffer -- return semaphore and wait
+                // Nothing in buffer — return semaphore and wait
                 xSemaphoreGive(_txDone);
                 continue;
             }
@@ -386,14 +405,4 @@ void BleTransport::runDrainLoop()
         pendingN = 0;
         xSemaphoreGive(_txDone);
     }
-}
-
-bool BleTransport::hasRxData() const { return rxLen > 0; }
-
-size_t BleTransport::readRx(uint8_t *dst, size_t maxLen)
-{
-    size_t n = (rxLen < maxLen) ? rxLen : maxLen;
-    memcpy(dst, rxBuf, n);
-    rxLen = 0;
-    return n;
 }

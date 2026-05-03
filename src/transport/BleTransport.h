@@ -59,6 +59,14 @@ public:
     // No-op — kept so call sites in main.cpp compile without change.
     void update() {}
 
+    // Flush — wakes drain task immediately rather than waiting up to 5ms.
+    // Useful to force a clean packet boundary at end of a frame.
+    void flush() override
+    {
+        if (_drainTaskHandle)
+            xTaskNotifyGive(_drainTaskHandle);
+    }
+
     // Callbacks
     void onKey(std::function<void(uint8_t)> cb)                     { _bc.onKey(cb);   }
     void onTouch(std::function<void(uint8_t, int16_t, int16_t, uint8_t)> cb) override { _bc.onTouch(cb); }
@@ -68,14 +76,12 @@ public:
     BackChannelParser::Stats bcStats() const { return _bc.getStats(); }
     void resetBcStats()                      { _bc.resetStats(); }
 
-    // RX
-    bool   hasRxData() const;
-    size_t readRx(uint8_t *dst, size_t maxLen);
 
 private:
     friend class ServerCB;
     friend class TxCharCB;
     friend class RxCharCB;
+    friend void connUpdateTask(void*);
 
     NimBLEServer         *pServer  = nullptr;
     NimBLECharacteristic *pTxChar  = nullptr;
@@ -85,6 +91,7 @@ private:
     uint16_t              _connIntervalMax          = 0;
     float                 _connIntervalNegotiatedMs = 0;   // actual negotiated interval
     std::function<void(float)> _onConnInterval;
+    TaskHandle_t          _connUpdateTaskHandle     = nullptr;
 
     bool     _connected        = false;
     bool     _notifySubscribed = false;
@@ -108,11 +115,6 @@ private:
     TaskHandle_t _drainTaskHandle = nullptr;
 
     // How long sendBytes() blocks when TX stream buffer is full.
-
-    // ── RX ────────────────────────────────────────────────────────────────────
-    static constexpr size_t RX_BUF_SIZE = 256;
-    uint8_t         rxBuf[RX_BUF_SIZE];
-    volatile size_t rxLen = 0;
 
     BackChannelParser _bc;
     std::function<void(bool)> _subscribedCallback;

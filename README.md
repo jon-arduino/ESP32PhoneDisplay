@@ -118,7 +118,7 @@ ESP32PhoneDisplay display(transport);
 ```cpp
 void begin(uint16_t w, uint16_t h);   // call once after transport connects
 void clear(Color color = 0x0000);     // fill screen, reset cursor
-void flush();                          // push frame — call at end of each frame
+void flush();   // send GFX_CMD_FLUSH to phone + force immediate BLE send
 void setRotation(uint8_t r);          // 0–3 (0 = portrait)
 void invertDisplay(bool invert);
 uint16_t width();
@@ -283,6 +283,15 @@ bool isInAPMode() const;
 void setPowerSave(bool enable);   // default true
 ```
 
+#### Diagnostics
+
+```cpp
+BackChannelParser::Stats bcStats() const;
+void resetBcStats();
+```
+
+Same `Stats` struct as `BleTransport`. See BleTransport diagnostics section.
+
 #### RTT Statistics (WiFi only)
 
 WiFiTransport sends periodic pings and measures round-trip time:
@@ -371,7 +380,8 @@ if (p.z > RemoteTouchScreen::MINPRESSURE) {
     // p.z — 128 (contact) or 0 (lifted)
 }
 
-bool touched = ts.touched();
+bool touched  = ts.touched();
+bool active   = ts.isActive();   // false if begin() called before transport connected
 ```
 
 `getPoint()` always returns the most recent position and clears the path queue.

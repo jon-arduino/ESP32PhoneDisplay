@@ -17,9 +17,19 @@ RemoteTouchScreen::RemoteTouchScreen(GraphicsTransport &transport)
 
 void RemoteTouchScreen::begin(uint8_t mode, uint16_t interval_ms)
 {
+    // Always register callback — transport may not be connected yet but
+    // callback registration has no transport dependency.
     _transport.onTouch([this](uint8_t cmd, int16_t x, int16_t y, uint8_t z) {
         handleTouch(cmd, x, y, z);
     });
+
+    // Only send TOUCH_BEGIN if transport is ready. If not connected,
+    // caller must call begin() again after transport connects.
+    // isActive() returns false until TOUCH_BEGIN is successfully sent.
+    if (!_transport.canSend()) {
+        _active = false;
+        return;
+    }
 
     GfxTouchBeginPayload p;
     p.mode             = mode;

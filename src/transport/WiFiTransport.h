@@ -63,6 +63,10 @@ public:
         _bc.onTouch(cb);
     }
 
+    // Back-channel parser diagnostics
+    BackChannelParser::Stats bcStats() const { return _bc.getStats(); }
+    void resetBcStats()                      { _bc.resetStats(); }
+
     // ── Status ────────────────────────────────────────────────────────────────
     bool isConnected() const;
     bool isInAPMode()  const { return _apMode; }

@@ -62,15 +62,15 @@ public:
         // ── BLE callbacks ─────────────────────────────────────────────────────
         _ble.onSubscribed([this](bool ready) {
             if (ready) {
-                Serial.println("[Dual] BLE connected — activating");
+                Serial.printf("[Dual] BLE connected — activating\n");
                 _active = &_ble;
                 if (_onConnected) _onConnected();
             } else {
-                Serial.println("[Dual] BLE disconnected");
+                Serial.printf("[Dual] BLE disconnected\n");
                 if (_active == &_ble) {
                     // Switch to WiFi if it's connected
                     if (_wifi.canSend()) {
-                        Serial.println("[Dual] Switching to WiFi");
+                        Serial.printf("[Dual] Switching to WiFi\n");
                         _active = &_wifi;
                         if (_onConnected) _onConnected();
                     } else {
@@ -87,11 +87,11 @@ public:
 
         // ── WiFi callbacks ────────────────────────────────────────────────────
         _wifi.onConnected([this]() {
-            Serial.println("[Dual] WiFi connected — activating");
+            Serial.printf("[Dual] WiFi connected — activating\n");
             // If setPowerSave(false) was requested, shut down BLE stack now
             // that WiFi is connected. Must be done before setPowerSave(false).
             if (_disablePowerSave && !_bleStopped) {
-                Serial.println("[Dual] Shutting down BLE for full WiFi performance");
+                Serial.printf("[Dual] Shutting down BLE for full WiFi performance\n");
                 _ble.stop();                  // kill drain task before deinit
                 NimBLEDevice::deinit(true);   // fully shut down NimBLE stack
                 _bleStopped = true;
@@ -102,11 +102,11 @@ public:
         });
 
         _wifi.onDisconnected([this]() {
-            Serial.println("[Dual] WiFi disconnected");
+            Serial.printf("[Dual] WiFi disconnected\n");
             if (_active == &_wifi) {
                 // Switch to BLE if it's connected
                 if (_ble.canSend()) {
-                    Serial.println("[Dual] Switching to BLE");
+                    Serial.printf("[Dual] Switching to BLE\n");
                     _active = &_ble;
                     if (_onConnected) _onConnected();
                 } else {
@@ -180,6 +180,20 @@ public:
     uint32_t rttAvg()   const { return _wifi.rttAvg();   }
     uint32_t rttCount() const { return _wifi.rttCount(); }
     void     resetRttStats()  { _wifi.resetRttStats();   }
+
+    // ── Back-channel diagnostics ─────────────────────────────────────────────
+    // Returns stats from whichever transport is active.
+    BackChannelParser::Stats bcStats() const
+    {
+        if (_active == &_ble)  return _ble.bcStats();
+        if (_active == &_wifi) return _wifi.bcStats();
+        return BackChannelParser::Stats{};
+    }
+    void resetBcStats()
+    {
+        _ble.resetBcStats();
+        _wifi.resetBcStats();
+    }
 
     // ── BLE connection interval ───────────────────────────────────────────────
     // Set before begin() or call on active connection to renegotiate.
