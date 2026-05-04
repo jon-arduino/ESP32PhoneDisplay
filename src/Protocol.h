@@ -25,6 +25,13 @@ static constexpr uint8_t BC_CMD_PONG = 0xF1;  // reply to GFX_CMD_PING, no paylo
 static constexpr uint8_t BC_CMD_KEY1 = 0xF2;  // no payload
 static constexpr uint8_t BC_CMD_KEY2 = 0xF3;  // no payload
 
+// ── App events (iPhone → ESP32) ──────────────────────────────────────────────
+// Sent by iPhone ~100ms after connect/reconnect — framebuffer may be stale.
+// ESP32 is not required to handle this; ignoring it is safe.
+static constexpr uint8_t BC_CMD_REDRAW_REQUEST = 0xE0;  // no payload
+// Reserved for future use:
+// BC_CMD_FLUSH_DONE = 0xE1  — response to GFX_CMD_FLUSH_SYNC (future sprint)
+
 // ── Touch events ─────────────────────────────────────────────────────────────
 //  Coordinates are mapped to virtual display space (0,0)..(w-1,h-1).
 //  Compatible with Adafruit_TouchScreen TSPoint API — see RemoteTouchScreen.h.
@@ -35,7 +42,6 @@ static constexpr uint8_t BC_CMD_TOUCH_DOWN = 0x10;
 static constexpr uint8_t BC_CMD_TOUCH_MOVE = 0x11;
 static constexpr uint8_t BC_CMD_TOUCH_UP   = 0x12;
 
-static constexpr uint8_t BC_TOUCH_PRESSURE    = 0xFF;
 static constexpr uint8_t BC_TOUCH_PAYLOAD_LEN = 5;    // x(2)+y(2)+z(1)
 static constexpr uint8_t BC_NO_PAYLOAD_LEN    = 0;
 

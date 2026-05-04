@@ -62,6 +62,11 @@ void BackChannelParser::dispatch(uint8_t cmd, const uint8_t *payload, size_t pay
             if (_pongCallback) _pongCallback();
             break;
 
+        case BC_CMD_REDRAW_REQUEST:
+            _stats.redrawRequests++;
+            if (_redrawCallback) _redrawCallback();
+            break;
+
         case BC_CMD_KEY1:
             _stats.key1++;
             if (_keyCallback) _keyCallback('1');

@@ -4,15 +4,19 @@
 // activate it. Demonstrates the standard Adafruit_GFX_Button
 // pattern that works unchanged with RemoteTouchScreen.
 //
+// Also demonstrates:
+//   - setTitle() — nav bar title
+//   - setButton1/2() — toolbar buttons (T1/T2)
+//   - onRedrawRequest() — clean reconnect behavior
+//
 // Uses ESP32PhoneDisplay_Compat (Adafruit_GFX subclass) because
 // Adafruit_GFX_Button::initButtonUL() requires an Adafruit_GFX*
-// pointer. For display-only sketches without GFX_Button, the
-// native ESP32PhoneDisplay class is more efficient.
+// pointer.
 
 #include <ESP32PhoneDisplay_Compat.h>
 #include <transport/BleTransport.h>
 #include <touch/RemoteTouchScreen.h>
-#include <Adafruit_GFX.h>   // for Adafruit_GFX_Button
+#include <Adafruit_GFX.h>
 
 // ── Colours ───────────────────────────────────────────────────────────────────
 #define BLACK   0x0000
@@ -32,9 +36,126 @@ ESP32PhoneDisplay_Compat tft(transport, DISP_W, DISP_H);
 RemoteTouchScreen        ts(transport);
 
 // ── Buttons ───────────────────────────────────────────────────────────────────
-// initButtonUL(gfx, x, y, w, h, outline, fill, textcolor, label, textsize)
-// x,y is the UPPER-LEFT corner of the button
 Adafruit_GFX_Button btnRed, btnGreen, btnBlue;
+
+static volatile bool _drawPending = false;
+
+// ── Forward declarations ──────────────────────────────────────────────────────
+void initDisplay();
+void drawButtons(bool redActive, bool greenActive, bool blueActive);
+void updateStatus(const char *msg, uint16_t color);
+
+// ── Setup ─────────────────────────────────────────────────────────────────────
+
+void setup()
+{
+    Serial.begin(115200);
+
+    // Set nav bar title and toolbar buttons
+    // Called before begin() — sent to phone after connection
+    transport.onSubscribed([](bool ready) {
+        if (ready)  _drawPending = true;
+    });
+
+    transport.onRedrawRequest([]() {
+        _drawPending = true;
+    });
+
+    transport.onKey([](uint8_t key) {
+        // T1/T2 key events from toolbar buttons
+        if      (key == '1') Serial.println("[Key] T1 pressed");
+        else if (key == '2') Serial.println("[Key] T2 pressed");
+    });
+
+    transport.begin();
+    Serial.println("[BLE] Waiting for iPhone...");
+
+    while (!_drawPending) delay(100);
+    _drawPending = false;
+
+    initDisplay();
+}
+
+// ── loop() ────────────────────────────────────────────────────────────────────
+
+void loop()
+{
+    // Handle reconnect redraw
+    if (_drawPending) {
+        _drawPending = false;
+        initDisplay();
+        return;
+    }
+
+    TSPoint p = ts.getPoint();
+    bool touching = (p.z > RemoteTouchScreen::MINPRESSURE);
+
+    btnRed.press(touching   && btnRed.contains(p.x, p.y));
+    btnGreen.press(touching && btnGreen.contains(p.x, p.y));
+    btnBlue.press(touching  && btnBlue.contains(p.x, p.y));
+
+    if (btnRed.justPressed()) {
+        drawButtons(true, false, false);
+        updateStatus("RED selected", RED);
+        Serial.println("[Touch] RED");
+    }
+    if (btnGreen.justPressed()) {
+        drawButtons(false, true, false);
+        updateStatus("GREEN selected", GREEN);
+        Serial.println("[Touch] GREEN");
+    }
+    if (btnBlue.justPressed()) {
+        drawButtons(false, false, true);
+        updateStatus("BLUE selected", BLUE);
+        Serial.println("[Touch] BLUE");
+    }
+}
+
+// ── Display init ──────────────────────────────────────────────────────────────
+
+void initDisplay()
+{
+    tft.begin();
+
+    // Nav bar title and toolbar buttons
+    tft.setTitle("Touch Buttons");
+    tft.setButton1("T1");    // sends BC_CMD_KEY1 when pressed
+    tft.setButton2("T2");    // sends BC_CMD_KEY2 when pressed
+
+    tft.fillScreen(BLACK);
+
+    // Screen title
+    tft.setCursor(20, 20);
+    tft.setTextColor(WHITE);
+    tft.setTextSize(2);
+    tft.print("Touch Buttons");
+
+    // Log what the phone received
+    Serial.println("[Display] begin + setTitle + setButton1/2 sent");
+
+    // Init GFX buttons
+    btnRed.initButtonUL(&tft,
+                        20, 100, 180, 50,
+                        WHITE, RED, WHITE,
+                        (char*)"RED", 2);
+
+    btnGreen.initButtonUL(&tft,
+                          20, 170, 180, 50,
+                          WHITE, DKGREEN, WHITE,
+                          (char*)"GREEN", 2);
+
+    btnBlue.initButtonUL(&tft,
+                         20, 240, 180, 50,
+                         WHITE, BLUE, WHITE,
+                         (char*)"BLUE", 2);
+
+    drawButtons(false, false, false);
+    updateStatus("Tap a button", GREY);
+
+    ts.begin();
+
+    Serial.println("[Display] Ready");
+}
 
 void drawButtons(bool redActive, bool greenActive, bool blueActive)
 {
@@ -52,77 +173,4 @@ void updateStatus(const char *msg, uint16_t color)
     tft.setTextSize(2);
     tft.print(msg);
     tft.flush();
-}
-
-void setup()
-{
-    Serial.begin(115200);
-    transport.begin();
-
-    Serial.println("Waiting for iPhone...");
-    while (!tft.isConnected()) { delay(100); }
-
-    tft.begin();
-    tft.fillScreen(BLACK);
-
-    // Title
-    tft.setCursor(20, 20);
-    tft.setTextColor(WHITE);
-    tft.setTextSize(2);
-    tft.print("Touch Buttons");
-
-    // Init buttons — tft is Adafruit_GFX* compatible
-    btnRed.initButtonUL(&tft,
-                        20, 100,           // x, y upper-left
-                        180, 50,           // w, h
-                        WHITE, RED, WHITE,
-                        (char*)"RED", 2);
-
-    btnGreen.initButtonUL(&tft,
-                          20, 170,
-                          180, 50,
-                          WHITE, DKGREEN, WHITE,
-                          (char*)"GREEN", 2);
-
-    btnBlue.initButtonUL(&tft,
-                         20, 240,
-                         180, 50,
-                         WHITE, BLUE, WHITE,
-                         (char*)"BLUE", 2);
-
-    drawButtons(false, false, false);
-    updateStatus("Tap a button", GREY);
-
-    // Start touch — 50ms throttle is fine for buttons
-    ts.begin();
-
-    Serial.println("Ready!");
-}
-
-void loop()
-{
-    TSPoint p = ts.getPoint();
-    bool touching = (p.z > RemoteTouchScreen::MINPRESSURE);
-
-    // Feed touch state to each button
-    btnRed.press(touching   && btnRed.contains(p.x, p.y));
-    btnGreen.press(touching && btnGreen.contains(p.x, p.y));
-    btnBlue.press(touching  && btnBlue.contains(p.x, p.y));
-
-    // React to button events
-    if (btnRed.justPressed()) {
-        drawButtons(true, false, false);
-        updateStatus("RED selected", RED);
-        Serial.println("RED");
-    }
-    if (btnGreen.justPressed()) {
-        drawButtons(false, true, false);
-        updateStatus("GREEN selected", GREEN);
-        Serial.println("GREEN");
-    }
-    if (btnBlue.justPressed()) {
-        drawButtons(false, false, true);
-        updateStatus("BLUE selected", BLUE);
-        Serial.println("BLUE");
-    }
 }

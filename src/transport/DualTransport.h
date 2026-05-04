@@ -181,6 +181,12 @@ public:
     uint32_t rttCount() const { return _wifi.rttCount(); }
     void     resetRttStats()  { _wifi.resetRttStats();   }
 
+    void onRedrawRequest(std::function<void()> cb)
+    {
+        _ble.onRedrawRequest(cb);
+        _wifi.onRedrawRequest(cb);
+    }
+
     // ── Back-channel diagnostics ─────────────────────────────────────────────
     // Returns stats from whichever transport is active.
     BackChannelParser::Stats bcStats() const

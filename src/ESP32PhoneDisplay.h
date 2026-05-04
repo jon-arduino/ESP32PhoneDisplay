@@ -50,6 +50,26 @@ public:
     // The iPhone app scales to fill the screen — choose any resolution.
     void begin(uint16_t w, uint16_t h);
 
+    // ── Display session ───────────────────────────────────────────────────────
+    // close() — end session gracefully. Phone clears screen, resets title and
+    // buttons. Call before begin() with new dimensions, or when sketch exits.
+    void close();
+
+    // setTitle() — set iPhone navigation bar title.
+    // Empty string resets to transport default ("BLE Display" / "WiFi Display").
+    // Persists across brief disconnects. Cleared by begin() or close().
+    void setTitle(const char *title);
+
+    // setButton1/2() — add or update a toolbar button on the iPhone nav bar.
+    // Button1 always appears left of Button2 regardless of send order.
+    // When pressed, iPhone sends BC_CMD_KEY1 / BC_CMD_KEY2 over back-channel.
+    // clearButtons() removes all buttons. No per-button clear — use clearButtons()
+    // then re-add any buttons you want to keep.
+    // Persists across brief disconnects. Cleared by begin() or close().
+    void setButton1(const char *label);
+    void setButton2(const char *label);
+    void clearButtons();
+
     // Fill screen with colour and reset cursor to (0,0)
     void clear(Color color = 0x0000);
 

@@ -52,6 +52,13 @@ public:
     void flush();
 
     // ── Required Adafruit_GFX override ───────────────────────────────────────
+    // ── Display session ───────────────────────────────────────────────────────
+    void close();
+    void setTitle(const char *title);
+    void setButton1(const char *label);
+    void setButton2(const char *label);
+    void clearButtons();
+
     void drawPixel(int16_t x, int16_t y, uint16_t color) override;
 
     // ── Performance overrides ─────────────────────────────────────────────────

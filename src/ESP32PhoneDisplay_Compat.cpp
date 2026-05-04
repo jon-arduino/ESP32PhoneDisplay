@@ -1,4 +1,5 @@
 #include "ESP32PhoneDisplay_Compat.h"
+#include "Protocol.h"
 #include <string.h>
 
 static constexpr uint8_t MAGIC = 0xA5;
@@ -18,12 +19,56 @@ void ESP32PhoneDisplay_Compat::begin()
 {
     GfxBeginPayload p{ (uint16_t)WIDTH, (uint16_t)HEIGHT };
     sendCommand(GFX_CMD_BEGIN, &p, sizeof(p));
+    sendCommand(GFX_CMD_FLUSH, nullptr, 0);   // ensure BEGIN processed before subsequent commands
+    _transport.flush();
 }
 
 void ESP32PhoneDisplay_Compat::flush()
 {
     sendCommand(GFX_CMD_FLUSH, nullptr, 0);
     _transport.flush();
+}
+
+void ESP32PhoneDisplay_Compat::close()
+{
+    sendCommand(GFX_CMD_FLUSH, nullptr, 0);
+    _transport.flush();
+    sendCommand(GFX_CMD_CLOSE_DISPLAY, nullptr, 0);
+    _transport.flush();
+}
+
+void ESP32PhoneDisplay_Compat::setTitle(const char *title)
+{
+    if (!title) title = "";
+    sendCommand(GFX_CMD_SET_TITLE,
+                reinterpret_cast<const void*>(title), (uint16_t)strlen(title));
+}
+
+void ESP32PhoneDisplay_Compat::setButton1(const char *label)
+{
+    if (!label) label = "";
+    uint8_t labelLen = (uint8_t)strlen(label);
+    uint8_t buf[2 + 8];
+    buf[0] = BC_CMD_KEY1;
+    buf[1] = labelLen;
+    memcpy(&buf[2], label, labelLen);
+    sendCommand(GFX_CMD_ADD_BUTTON, buf, 2 + labelLen);
+}
+
+void ESP32PhoneDisplay_Compat::setButton2(const char *label)
+{
+    if (!label) label = "";
+    uint8_t labelLen = (uint8_t)strlen(label);
+    uint8_t buf[2 + 8];
+    buf[0] = BC_CMD_KEY2;
+    buf[1] = labelLen;
+    memcpy(&buf[2], label, labelLen);
+    sendCommand(GFX_CMD_ADD_BUTTON, buf, 2 + labelLen);
+}
+
+void ESP32PhoneDisplay_Compat::clearButtons()
+{
+    sendCommand(GFX_CMD_CLEAR_BUTTONS, nullptr, 0);
 }
 
 void ESP32PhoneDisplay_Compat::drawPixel(int16_t x, int16_t y, uint16_t color)

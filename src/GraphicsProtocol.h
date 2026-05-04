@@ -11,7 +11,7 @@
 //  Do not add fields, change types, or reorder without updating both sides.
 // -----------------------------------------------------------------------------
 
-#define GFX_PROTOCOL_VERSION 1
+#define GFX_PROTOCOL_VERSION 2
 
 // ── Command opcodes ───────────────────────────────────────────────────────────
 enum GfxCommand : uint8_t
@@ -22,6 +22,16 @@ enum GfxCommand : uint8_t
     GFX_CMD_FLUSH           = 0x03,
     GFX_CMD_SET_ROTATION    = 0x05,
     GFX_CMD_INVERT_DISPLAY  = 0x06,
+
+    // ── Display session ───────────────────────────────────────────────────────
+    GFX_CMD_CLOSE_DISPLAY   = 0x07,  // no payload — end session, clear screen
+    GFX_CMD_SET_TITLE       = 0x08,  // payload: UTF-8 string (no null terminator)
+    GFX_CMD_CLEAR_BUTTONS   = 0x09,  // no payload — remove all toolbar buttons
+    GFX_CMD_ADD_BUTTON      = 0x0A,  // payload: keyCode(u8) labelLen(u8) label(utf8)
+                                      //   keyCode: BC_CMD_KEY1(0xF2) or BC_CMD_KEY2(0xF3)
+                                      //   KEY1 always renders left of KEY2
+    // Reserved: GFX_CMD_FLUSH_SYNC = 0x04  — future sprint
+
 
     // Pixels & Lines
     GFX_CMD_DRAW_PIXEL      = 0x10,

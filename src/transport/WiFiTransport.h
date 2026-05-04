@@ -100,7 +100,8 @@ public:
     void onDisconnected(std::function<void()> cb)         { _onDisconnected = cb; }
     void onFirstPong   (std::function<void()> cb)         { _ping.onFirstPong(cb); }
     void onRtt         (std::function<void(uint32_t)> cb) { _ping.onRtt(cb); }
-    void onKey         (std::function<void(uint8_t)> cb)  { _bc.onKey(cb);  }
+    void onKey          (std::function<void(uint8_t)> cb)  { _bc.onKey(cb);           }
+    void onRedrawRequest(std::function<void()> cb)        { _bc.onRedrawRequest(cb); }
 
     // ── SoftAP switch ─────────────────────────────────────────────────────────
     void switchToSoftAP();

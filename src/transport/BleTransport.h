@@ -69,6 +69,7 @@ public:
 
     // Callbacks
     void onKey(std::function<void(uint8_t)> cb)                     { _bc.onKey(cb);   }
+    void onRedrawRequest(std::function<void()> cb)                   { _bc.onRedrawRequest(cb); }
     void onTouch(std::function<void(uint8_t, int16_t, int16_t, uint8_t)> cb) override { _bc.onTouch(cb); }
     void onSubscribed(std::function<void(bool)> cb) { _subscribedCallback = cb; }
 

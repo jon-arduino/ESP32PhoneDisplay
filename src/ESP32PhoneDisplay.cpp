@@ -1,6 +1,7 @@
 // ESP32PhoneDisplay.cpp
 #include "ESP32PhoneDisplay.h"
 #include "GraphicsProtocol.h"
+#include "Protocol.h"
 #include <string.h>
 
 // Wire format:
@@ -83,6 +84,8 @@ void ESP32PhoneDisplay::begin(uint16_t w, uint16_t h)
 {
     GfxBeginPayload p{w, h};
     sendCommand(GFX_CMD_BEGIN, &p, sizeof(p));
+    sendCommand(GFX_CMD_FLUSH, nullptr, 0);   // ensure BEGIN processed before subsequent commands
+    _transport.flush();                        // wake drain task immediately
     _baseW = w; _baseH = h; _rotation = 0;
 }
 
@@ -91,6 +94,46 @@ void ESP32PhoneDisplay::flush()
     sendCommand(GFX_CMD_FLUSH, nullptr, 0);
     _transport.flush();
 }
+
+void ESP32PhoneDisplay::close()
+{
+    sendCommand(GFX_CMD_FLUSH, nullptr, 0);         // flush any pending draws first
+    _transport.flush();
+    sendCommand(GFX_CMD_CLOSE_DISPLAY, nullptr, 0);
+    _transport.flush();                              // ensure close goes out immediately
+}
+
+void ESP32PhoneDisplay::setTitle(const char *title)
+{
+    if (!title) title = "";
+    uint16_t len = (uint16_t)strlen(title);
+    sendCommand(GFX_CMD_SET_TITLE,
+                reinterpret_cast<const void*>(title), len);
+}
+
+void ESP32PhoneDisplay::setButton1(const char *label)
+{
+    if (!label) label = "";
+    uint8_t  labelLen = (uint8_t)strlen(label);
+    // GFX_CMD_ADD_BUTTON payload: keyCode(u8) labelLen(u8) label(utf8)
+    uint8_t buf[2 + 8];   // keyCode + labelLen + up to 8 chars
+    buf[0] = BC_CMD_KEY1;
+    buf[1] = labelLen;
+    memcpy(&buf[2], label, labelLen);
+    sendCommand(GFX_CMD_ADD_BUTTON, buf, 2 + labelLen);
+}
+
+void ESP32PhoneDisplay::setButton2(const char *label)
+{
+    if (!label) label = "";
+    uint8_t  labelLen = (uint8_t)strlen(label);
+    uint8_t buf[2 + 8];
+    buf[0] = BC_CMD_KEY2;
+    buf[1] = labelLen;
+    memcpy(&buf[2], label, labelLen);
+    sendCommand(GFX_CMD_ADD_BUTTON, buf, 2 + labelLen);
+}
+
 
 void ESP32PhoneDisplay::setRotation(uint8_t r)
 {
