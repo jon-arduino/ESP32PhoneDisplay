@@ -102,6 +102,7 @@ public:
     void onRtt         (std::function<void(uint32_t)> cb) { _ping.onRtt(cb); }
     void onKey          (std::function<void(uint8_t)> cb)  { _bc.onKey(cb);           }
     void onRedrawRequest(std::function<void()> cb)        { _bc.onRedrawRequest(cb); }
+    void onDisplayAvailable(std::function<void(bool)> cb)   { _bc.onDisplayAvailable(cb); }
 
     // ── SoftAP switch ─────────────────────────────────────────────────────────
     void switchToSoftAP();

@@ -18,7 +18,7 @@
 //
 //    transport.begin();
 //    display.begin(240, 320);
-//    display.clear(0x0000);
+//    display.fillScreen(0x0000);
 //    display.setCursor(10, 10);
 //    display.setTextColor(0xFFFF);
 //    display.print("Hello iPhone!");
@@ -71,7 +71,8 @@ public:
     void clearButtons();
 
     // Fill screen with colour and reset cursor to (0,0)
-    void clear(Color color = 0x0000);
+    // fillScreen() — fill screen with colour, equivalent to Adafruit_GFX fillScreen()
+    void fillScreen(Color color = 0x0000);
 
     // Push buffered commands — call at the end of each frame
     void flush();
@@ -127,6 +128,16 @@ public:
     // Print interface — called by print()/println()
     size_t write(uint8_t c) override;
 
+    // getTextBounds() — compute bounding box of a string without drawing.
+    // Pure local arithmetic — no BLE commands sent. Handles both the built-in
+    // 5×7 font and custom GFXfonts. Equivalent to Adafruit_GFX::getTextBounds()
+    // so existing centering/layout code ports without changes.
+    //
+    // (x,y)          — cursor position at start of string
+    // (x1,y1,w,h)    — tight bounding box of rendered text in pixels
+    void getTextBounds(const char *str, int16_t x, int16_t y,
+                       int16_t *x1, int16_t *y1, uint16_t *w, uint16_t *h);
+
 private:
     GraphicsTransport &_transport;
 
@@ -146,4 +157,10 @@ private:
     void sendCommandWithTail(uint8_t cmd,
                              const void *fixed,  uint16_t fixedLen,
                              const void *tail,   uint16_t tailLen);
+
+    // getTextBounds helper — advances (x,y) and expands bounding box per character.
+    // Mirrors Adafruit_GFX::charBounds() using our local state instead of inheritance.
+    void _charBoundsNative(uint8_t c, int16_t *x, int16_t *y,
+                           int16_t *minX, int16_t *minY,
+                           int16_t *maxX, int16_t *maxY);
 };

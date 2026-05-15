@@ -26,11 +26,20 @@ static constexpr uint8_t BC_CMD_KEY1 = 0xF2;  // no payload
 static constexpr uint8_t BC_CMD_KEY2 = 0xF3;  // no payload
 
 // ── App events (iPhone → ESP32) ──────────────────────────────────────────────
-// Sent by iPhone ~100ms after connect/reconnect — framebuffer may be stale.
-// ESP32 is not required to handle this; ignoring it is safe.
+
+// Sent when app returns to foreground after being backgrounded — display state
+// is unknown, ESP32 should rebuild current display. Not sent on fresh connect
+// or reconnect; use BC_CMD_DISPLAY_AVAILABLE for those cases.
 static constexpr uint8_t BC_CMD_REDRAW_REQUEST = 0xE0;  // no payload
-// Reserved for future use:
-// BC_CMD_FLUSH_DONE = 0xE1  — response to GFX_CMD_FLUSH_SYNC (future sprint)
+
+// Sent ~100ms after connect/reconnect (0x01) and when display goes offline
+// (0x00 — app backgrounded, phone locked, app switch, clean disconnect).
+// Payload: 1 byte — 0x01 = available, 0x00 = unavailable.
+// Primary signal for pausing/resuming drawing and triggering initial redraw.
+static constexpr uint8_t BC_CMD_DISPLAY_AVAILABLE = 0xE1;  // payload: 1 byte
+
+// Reserved for future use — response to GFX_CMD_FLUSH_SYNC (future sprint).
+static constexpr uint8_t BC_CMD_FLUSH_DONE = 0xE2;
 
 // ── Touch events ─────────────────────────────────────────────────────────────
 //  Coordinates are mapped to virtual display space (0,0)..(w-1,h-1).

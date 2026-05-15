@@ -108,13 +108,122 @@ Explicit `flush()` is recommended at frame boundaries but not required.
 
 ## BleTransport
 
-Uses Nordic UART Service (NUS) over NimBLE-Arduino. An `xStreamBuffer`
-(8KB) decouples the graphics thread from the BLE radio. A drain task
-on core 0 sends notifications as fast as the BLE connection allows.
+Uses Nordic UART Service (NUS) over NimBLE-Arduino.
 
-BLE connection interval is controlled by iOS (typically 15–45ms) and
-limits throughput and latency. For latency-sensitive apps (touch paint,
-games), WiFi is recommended.
+### Architecture
+
+An `xStreamBuffer` (8KB) decouples the graphics thread from the BLE radio.
+A drain task on core 0 pulls commands from the buffer and sends BLE
+notifications as fast as the connection allows:
+
+```
+send()  → writes framed packet into 8KB stream buffer (never blocks on radio)
+flush() → sends GFX_CMD_FLUSH marker + wakes drain task for immediate send
+drain task (core 0):
+    - sleeps until notified by flush() or timer
+    - drains stream buffer into BLE notifications (up to MTU per notification)
+    - auto-flushes if bytes are idle in the buffer
+```
+
+### Auto-flush
+
+The drain task auto-flushes buffered commands if they sit idle for more than
+one connection interval. Calling `flush()` explicitly is recommended at frame
+boundaries — it ensures deterministic delivery and keeps packet count
+predictable — but is not strictly required for simple displays.
+
+### Callbacks
+
+All BLE callbacks fire on core 0 (the NimBLE host task). Never call display
+functions, `Serial.print()`, or any blocking operation from a callback.
+Set a volatile flag and act on it in `loop()` instead. See the examples and
+the logging note in the main README for details.
+
+```cpp
+// Called at the GATT level on BLE connect (ready=true) or disconnect (ready=false).
+// Set _drawPending on connect as a reliable fallback — onRedrawRequest may not fire
+// on all app versions. Both setting _drawPending is safe; a double-draw is harmless.
+// Use the disconnect case (ready=false) to pause drawing.
+transport.onSubscribed([](bool ready) { ... });
+
+// Called when iPhone presses T1 (key='1') or T2 (key='2') toolbar button.
+transport.onKey([](uint8_t key) { ... });
+
+// Called when iOS accepts or changes the BLE connection interval.
+transport.onConnInterval([](float intervalMs) { ... });
+```
+
+### onRedrawRequest
+
+```cpp
+transport.onRedrawRequest([]() { ... });
+```
+
+The iPhone app sends `BC_CMD_REDRAW_REQUEST` in two situations:
+
+**1. After BLE reconnect.**
+The iPhone's framebuffer persists across a BLE disconnect — the display
+shows stale content, not a blank screen. When BLE reconnects, any commands
+the ESP32 sends are applied on top of that stale state, producing a garbled
+display. The app sends `BC_CMD_REDRAW_REQUEST` to ask the ESP32 to rebuild
+the full screen from scratch.
+
+**2. When the app returns to the foreground.**
+If the user switches to another app and back, BLE stays connected the whole
+time but the app may not have rendered commands received while backgrounded.
+The display state is unknown. The app sends `BC_CMD_REDRAW_REQUEST` on
+foreground so the ESP32 can rebuild a coherent display — even though BLE
+was never dropped.
+
+`onSubscribed(true)` alone cannot cover case 2. If you want the display to
+stay correct across reconnects and app switching, register `onRedrawRequest`
+and rebuild your full screen there:
+
+```cpp
+transport.onRedrawRequest([]() {
+    _drawPending = true;    // set flag — act in loop(), not here
+});
+
+// onSubscribed sets _drawPending too as a reliable fallback —
+// onRedrawRequest may not fire on all app versions. Double-draw is harmless.
+transport.onSubscribed([](bool ready) {
+    if (ready) { _paused = false; _drawPending = true; }
+    else       { _paused = true; }
+});
+```
+
+For static displays that never update, `onRedrawRequest` is still recommended
+— without it a reconnect or app-switch leaves stale content on screen until
+the next draw call.
+
+### Connection interval
+
+BLE connection interval controls how often data is exchanged. Lower interval
+= more responsive, higher power draw. iOS minimum is 15ms. Default is
+iOS-negotiated (~25ms).
+
+```cpp
+// Set before begin() — applied after iOS settling time on connect
+transport.setConnectionInterval(15, 30);   // request 15–30ms
+
+// Renegotiate on an active connection
+transport.updateConnectionInterval(15, 30);
+
+// Query current interval (0 if not yet known)
+float ms = transport.connIntervalMs();
+```
+
+For latency-sensitive applications (games, touch paint), WiFi transport
+gives significantly lower and more consistent latency than BLE.
+
+### Diagnostics
+
+```cpp
+BackChannelParser::Stats s = transport.bcStats();
+transport.resetBcStats();
+```
+
+See main README for `Stats` field descriptions.
 
 ---
 

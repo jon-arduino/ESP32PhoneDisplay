@@ -44,9 +44,16 @@ public:
     // Called for KEY1 ('1') and KEY2 ('2') button events.
     void onKey(std::function<void(uint8_t key)> cb) { _keyCallback = cb; }
 
-    // Called when iPhone requests a full redraw (~100ms after connect/reconnect).
-    // Optional — ignoring it is safe. Use to trigger redraw on reconnect.
+    // Called when app returns to foreground after backgrounding — display state
+    // is unknown, rebuild current display. Not fired on fresh connect;
+    // use onDisplayAvailable for that.
     void onRedrawRequest(std::function<void()> cb) { _redrawCallback = cb; }
+
+    // Called when display availability changes. available=true means display
+    // is ready (~100ms after connect/reconnect, or app returned to foreground).
+    // available=false means display is offline (app backgrounded, phone locked,
+    // app switched, or clean disconnect). Primary signal for pause/resume.
+    void onDisplayAvailable(std::function<void(bool)> cb) { _onDisplayAvailable = cb; }
 
     // Called for touch events. cmd = BC_CMD_TOUCH_DOWN / TOUCH_MOVE / TOUCH_UP.
     // x, y are virtual display coordinates (0,0)–(displayW-1, displayH-1).
@@ -67,7 +74,8 @@ public:
         uint32_t key2        = 0;   // KEY2 commands dispatched
         uint32_t touch       = 0;   // touch events dispatched
         uint32_t pong        = 0;   // pong responses dispatched
-        uint32_t redrawRequests = 0; // BC_CMD_REDRAW_REQUEST received
+        uint32_t redrawRequests    = 0; // BC_CMD_REDRAW_REQUEST received
+        uint32_t displayAvailable  = 0; // BC_CMD_DISPLAY_AVAILABLE received
         uint32_t syncErrors  = 0;   // bytes discarded waiting for BC_MAGIC
         uint32_t overruns    = 0;   // buffer overrun resets
         uint32_t invalidFrames = 0; // invalid frameLen resets
@@ -84,6 +92,7 @@ private:
     std::function<void()>                                    _pongCallback;
     std::function<void(uint8_t)>                             _keyCallback;
     std::function<void()>                                    _redrawCallback;
+    std::function<void(bool)>                                _onDisplayAvailable;
     std::function<void(uint8_t, int16_t, int16_t, uint8_t)>  _touchCallback;
 
     Stats _stats;

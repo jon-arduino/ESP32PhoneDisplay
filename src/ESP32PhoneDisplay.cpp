@@ -148,7 +148,7 @@ void ESP32PhoneDisplay::invertDisplay(bool i)
     sendCommand(GFX_CMD_INVERT_DISPLAY, &p, sizeof(p));
 }
 
-void ESP32PhoneDisplay::clear(Color color)
+void ESP32PhoneDisplay::fillScreen(Color color)
 {
     GfxClearPayload p{color};
     sendCommand(GFX_CMD_FILL_SCREEN, &p, sizeof(p));
@@ -306,9 +306,103 @@ void ESP32PhoneDisplay::setFont(const GFXfont *font)
     sendCommand(GFX_CMD_SET_FONT, &p, sizeof(p));
 }
 
+void ESP32PhoneDisplay::clearButtons()
+{
+    sendCommand(GFX_CMD_CLEAR_BUTTONS, nullptr, 0);
+}
+
 size_t ESP32PhoneDisplay::write(uint8_t c)
 {
     GfxWriteCharPayload p{c};
     sendCommand(GFX_CMD_WRITE_CHAR, &p, sizeof(p));
     return 1;
+}
+
+// ── Text bounds ───────────────────────────────────────────────────────────────
+//
+// getTextBounds() and _charBoundsNative() are pure local arithmetic —
+// no commands are sent to the phone. They mirror Adafruit_GFX::getTextBounds()
+// and Adafruit_GFX::charBounds() exactly, using our locally tracked state
+// (_textSize, _font, _wrap, _baseW) instead of Adafruit_GFX inheritance.
+//
+// This lets native ESP32PhoneDisplay sketches compute text layout (centering,
+// background clearing) identically to Adafruit_GFX sketches without pulling
+// in the compat layer.
+
+void ESP32PhoneDisplay::_charBoundsNative(uint8_t c,
+                                           int16_t *x,    int16_t *y,
+                                           int16_t *minX, int16_t *minY,
+                                           int16_t *maxX, int16_t *maxY)
+{
+    if (_font) {
+        // ── GFXfont — per-glyph metrics ───────────────────────────────────────
+        if (c == '\n') {
+            *x  = 0;
+            *y += (int16_t)_font->yAdvance * _textSize;
+        } else if (c != '\r') {
+            uint8_t first = _font->first;
+            uint8_t last  = _font->last;
+            if (c >= first && c <= last) {
+                GFXglyph *g  = &_font->glyph[c - first];
+                int16_t   xa = (int16_t)g->xAdvance * _textSize;
+                // Wrap before measuring so bounds reflect post-wrap position
+                if (_wrap && (*x + xa) >= (int16_t)_baseW) {
+                    *x  = 0;
+                    *y += (int16_t)_font->yAdvance * _textSize;
+                }
+                int16_t x1 = *x + (int16_t)g->xOffset * _textSize;
+                int16_t y1 = *y + (int16_t)g->yOffset * _textSize;
+                int16_t x2 = x1  + (int16_t)g->width   * _textSize - 1;
+                int16_t y2 = y1  + (int16_t)g->height  * _textSize - 1;
+                if (x1 < *minX) *minX = x1;
+                if (y1 < *minY) *minY = y1;
+                if (x2 > *maxX) *maxX = x2;
+                if (y2 > *maxY) *maxY = y2;
+                *x += xa;
+            }
+        }
+    } else {
+        // ── Built-in 5×7 font — fixed metrics ────────────────────────────────
+        // Each character cell is 6×8 at textSize=1 (5px glyph + 1px gap wide,
+        // 7px glyph + 1px gap tall). Bounding box expands to cover full cell.
+        if (c == '\n') {
+            *x  = 0;
+            *y += _textSize * 8;
+        } else if (c != '\r') {
+            if (_wrap && (*x + _textSize * 6) > (int16_t)_baseW) {
+                *x  = 0;
+                *y += _textSize * 8;
+            }
+            int16_t x2 = *x + _textSize * 6 - 1;
+            int16_t y2 = *y + _textSize * 8 - 1;
+            if (*x  < *minX) *minX = *x;
+            if (*y  < *minY) *minY = *y;
+            if (x2  > *maxX) *maxX = x2;
+            if (y2  > *maxY) *maxY = y2;
+            *x += _textSize * 6;
+        }
+    }
+}
+
+void ESP32PhoneDisplay::getTextBounds(const char *str, int16_t x, int16_t y,
+                                       int16_t *x1, int16_t *y1,
+                                       uint16_t *w,  uint16_t *h)
+{
+    // Initialise outputs
+    *x1 = x; *y1 = y; *w = *h = 0;
+
+    if (!str || !*str) return;
+
+    // Scan string — cx/cy track the running cursor, min/max track the envelope
+    int16_t cx = x, cy = y;
+    int16_t minX = 0x7FFF, minY = 0x7FFF;
+    int16_t maxX = -1,     maxY = -1;
+
+    uint8_t c;
+    while ((c = (uint8_t)*str++) != '\0') {
+        _charBoundsNative(c, &cx, &cy, &minX, &minY, &maxX, &maxY);
+    }
+
+    if (maxX >= minX) { *x1 = minX; *w = (uint16_t)(maxX - minX + 1); }
+    if (maxY >= minY) { *y1 = minY; *h = (uint16_t)(maxY - minY + 1); }
 }

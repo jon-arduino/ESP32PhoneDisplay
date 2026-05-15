@@ -19,7 +19,7 @@
 //    void setup() {
 //        transport.onConnected([]() {
 //            display.begin(240, 320);
-//            display.clear(0x0000);
+//            display.fillScreen(0x0000);
 //            display.flush();
 //        });
 //        transport.begin();
@@ -185,6 +185,11 @@ public:
     {
         _ble.onRedrawRequest(cb);
         _wifi.onRedrawRequest(cb);
+    }
+    void onDisplayAvailable(std::function<void(bool)> cb)
+    {
+        _ble.onDisplayAvailable(cb);
+        _wifi.onDisplayAvailable(cb);
     }
 
     // ── Back-channel diagnostics ─────────────────────────────────────────────

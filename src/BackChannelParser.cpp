@@ -94,6 +94,14 @@ void BackChannelParser::dispatch(uint8_t cmd, const uint8_t *payload, size_t pay
             if (_touchCallback) _touchCallback(BC_CMD_TOUCH_UP, 0, 0, BC_TOUCH_Z_NONE);
             break;
 
+        case BC_CMD_DISPLAY_AVAILABLE:
+            _stats.displayAvailable++;
+            if (payload && payloadLen >= 1) {
+                bool available = payload[0] != 0x00;
+                if (_onDisplayAvailable) _onDisplayAvailable(available);
+            }
+            break;
+
         default:
             _stats.unknownCmds++;
             break;

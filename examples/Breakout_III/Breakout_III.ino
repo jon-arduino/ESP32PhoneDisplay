@@ -1,39 +1,47 @@
-// Breakout_II — fixed frame rate Breakout for ESP32PhoneDisplay
+// Breakout_III — replaces Breakout_II
 //
-// Improvements over Breakout:
+// Fully native ESP32PhoneDisplay (no compat layer). Every GFX operation
+// sends a single compact BLE command — fillRect, fillCircle, print() etc.
+// are all single commands regardless of size or content.
+//
+// Improvements over Breakout_II:
+//   - Native ESP32PhoneDisplay throughout — no Adafruit_GFX decomposition
+//   - setTitle / setButton1 / setButton2 via session API
+//   - onRedrawRequest for clean reconnect
+//   - BC diagnostic stats behind #define DEBUG
+//
+// Game features (carried from Breakout_II):
 //   - Fixed 30fps frame rate via millis()-based frame budget
-//   - Ball speed is pixels-per-frame (consistent regardless of BLE jitter)
-//   - Brick flash uses frame-state machine — no blocking delays
+//   - Ball speed in pixels-per-frame (consistent regardless of BLE jitter)
+//   - Brick flash state machine — no blocking delays
 //   - Ball pauses during brick flash (2 frames = 66ms)
-//   - Touch and physics decoupled from BLE timing
 //   - T1 = autoplay, T2 = player control
 //
 // Original game by Enrique Albertos (public domain)
 
 #include <Arduino.h>
-#include <ESP32PhoneDisplay_Compat.h>
+#include <ESP32PhoneDisplay.h>
 #include <transport/BleTransport.h>
 #include <touch/RemoteTouchScreen.h>
 
-
 // ── Tuning ────────────────────────────────────────────────────────────────────
 #define FRAME_MS             33    // target frame time (~30fps)
-#define SPEED_MULTIPLIER     6.0f  // multiply ball speed — tune until it feels right
-#define TOUCH_INTERVAL_MS    30    // iPhone MOVE event rate
-#define BLE_INTERVAL_MIN_MS  15    // BLE connection interval min
-#define BLE_INTERVAL_MAX_MS  30    // BLE connection interval max
-#define DEBUG                false // set true for loop timing diagnostics
+#define SPEED_MULTIPLIER     6.0f  // ball speed scale — tune to taste
+#define TOUCH_INTERVAL_MS    30    // iPhone MOVE event throttle (ms)
+#define BLE_INTERVAL_MIN_MS  15    // BLE connection interval min (ms)
+#define BLE_INTERVAL_MAX_MS  30    // BLE connection interval max (ms)
+#define DEBUG                0     // 1 = frame overrun prints + BC stats
 
 // ── Colours ───────────────────────────────────────────────────────────────────
-#define BLACK    0x0000
-#define BLUE     0x001F
-#define RED      0xF800
-#define GREEN    0x07E0
-#define CYAN     0x07FF
-#define MAGENTA  0xF81F
-#define YELLOW   0xFFE0
-#define WHITE    0xFFFF
-#define PRIMARY_DARK_COLOR  0x4016
+#define BLACK           0x0000
+#define BLUE            0x001F
+#define RED             0xF800
+#define GREEN           0x07E0
+#define CYAN            0x07FF
+#define MAGENTA         0xF81F
+#define YELLOW          0xFFE0
+#define WHITE           0xFFFF
+#define PRIMARY_DARK    0x4016
 
 // ── Display ───────────────────────────────────────────────────────────────────
 #define DISP_W  240
@@ -43,12 +51,7 @@
 #define SCORE_SIZE   30
 #define GAMES_NUMBER 16
 
-char scoreFormat[] = "%04d";
-
-typedef struct {
-    int16_t x, y, width, height;
-} gameSize_type;
-
+// ── Types ─────────────────────────────────────────────────────────────────────
 typedef struct {
     int ballsize, playerwidth, playerheight, exponent, top, rows, columns, brickGap, lives;
     int wall[GAMES_NUMBER];
@@ -56,7 +59,7 @@ typedef struct {
 } game_type;
 
 typedef struct {
-    int32_t  ballx, bally, ballxold, ballyold;  // fixed-point, signed for correct wrap handling
+    int32_t  ballx, bally, ballxold, ballyold;  // fixed-point
     int velx, vely, playerx, playerxold;
     int wallState[8];
     int score, remainingLives, top, bottom, walltop, wallbottom, brickheight, brickwidth;
@@ -89,16 +92,17 @@ void startBrickFlash(game_state_type*, int, int);
 void checkBorderCollision(game_type*, game_state_type*, int16_t, int16_t);
 void checkBallExit(game_type*, game_state_type*, int16_t, int16_t);
 boolean noBricks(game_type*, game_state_type*);
-void drawBoxedString(uint16_t, uint16_t, const char*, uint16_t, uint16_t, uint16_t);
-void clearDialog();
+void drawBoxedString(int16_t, int16_t, const char*, uint8_t, uint16_t, uint16_t);
+void clearScreen();
 void touchToStart();
 void gameOverTouchToStart();
-int  readUiSelection(game_type*, game_state_type*, int16_t);
+void readUiSelection(game_type*, game_state_type*);
 int  waitForTouch();
 void redrawFullScreen();
 void setBrick(int[], uint8_t, uint8_t);
 void unsetBrick(int[], uint8_t, uint8_t);
 boolean isBrickIn(int[], uint8_t, uint8_t);
+void initDisplay();
 
 // ── Game data ─────────────────────────────────────────────────────────────────
 game_type games[GAMES_NUMBER] = {
@@ -121,138 +125,118 @@ game_type games[GAMES_NUMBER] = {
 };
 
 // ── Objects ───────────────────────────────────────────────────────────────────
-BleTransport              transport;
-ESP32PhoneDisplay_Compat  tft(transport, DISP_W, DISP_H);
-RemoteTouchScreen         ts(transport);
+BleTransport      transport;
+ESP32PhoneDisplay display(transport);
+RemoteTouchScreen ts(transport);
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── Game state ────────────────────────────────────────────────────────────────
 game_type*      game;
 game_state_type state;
-gameSize_type   gameSize;
 uint16_t        backgroundColor = BLACK;
 int             level;
 BrickFlash      flash;
 
 const uint8_t BIT_MASK[]     = {0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80};
 uint8_t       pointsForRow[] = {7,7,5,5,3,3,1,1};
+char          scoreFormat[]  = "%04d";
 
-static volatile bool  drawPending    = false;
-static volatile bool  _autoPlay      = false;
-static volatile bool  _paused        = false;  // true while disconnected
-static volatile int   _autoPlayMsg   = 0;    // 1=ON, 2=OFF — printed from loop()
-static volatile float _connIntervalMs = 0;   // >0 = new interval to print from loop()
-static volatile uint32_t _appKey1 = 0;       // incremented in onKey callback
-static volatile uint32_t _appKey2 = 0;
+// ── Volatile flags — set on core 0 (BLE task), read on core 1 (loop) ─────────
+// Never call Serial or display from BLE callbacks — use flags instead.
+static volatile bool     _drawPending    = false;
+static volatile bool     _autoPlay       = false;
+static volatile bool     _paused         = false;
+static volatile int      _autoPlayMsg    = 0;    // 1=ON 2=OFF — printed from loop()
+static volatile float    _connIntervalMs = 0;    // >0 = new interval to print
 
-
-// ── setup() ───────────────────────────────────────────────────────────────────
+// ── Setup ─────────────────────────────────────────────────────────────────────
 
 void setup()
 {
     Serial.begin(115200);
     uint32_t t = millis();
     while (!Serial && millis() - t < 3000) delay(10);
-    Serial.println("[Breakout_II] Booting...");
+    Serial.println("[Breakout_III] Booting...");
 
     transport.setConnectionInterval(BLE_INTERVAL_MIN_MS, BLE_INTERVAL_MAX_MS);
 
     transport.onConnInterval([](float ms) {
-        _connIntervalMs = ms;   // printed from loop() to avoid dual-core Serial interleave
+        _connIntervalMs = ms;
     });
 
     transport.onKey([](uint8_t key) {
-        if      (key == '1') { _autoPlay = true;  _autoPlayMsg = 1; _appKey1++; }
-        else if (key == '2') { _autoPlay = false; _autoPlayMsg = 2; _appKey2++; }
+        if      (key == '1') { _autoPlay = true;  _autoPlayMsg = 1; }
+        else if (key == '2') { _autoPlay = false; _autoPlayMsg = 2; }
     });
 
-    // Pause immediately on disconnect — stops physics and drawing
+    // onSubscribed: fallback for older app versions that don't send redraw request
     transport.onSubscribed([](bool ready) {
-        if (ready) {
-            // Fallback for iPhone app versions that don't send BC_CMD_REDRAW_REQUEST.
-            // When app is updated, onRedrawRequest fires ~100ms after connect
-            // and also sets drawPending — whichever fires first wins.
-            _paused     = false;
-            drawPending = true;
-        } else {
-            _paused = true;
-        }
+        if (ready) { _paused = false; _drawPending = true; }
+        else       { _paused = true; }
     });
 
-    // iPhone requests full redraw ~100ms after reconnect (new app versions)
+    // onRedrawRequest: sent by current app ~100ms after connect/reconnect
     transport.onRedrawRequest([]() {
-        _paused     = false;
-        drawPending = true;
+        _paused = false; _drawPending = true;
     });
 
     transport.begin();
     Serial.println("[Game] Waiting for iPhone...");
 
-    while (!drawPending) delay(100);
-    drawPending = false;
+    while (!_drawPending) delay(100);
+    _drawPending = false;
 
-    gameSize = {0, 0, DISP_W, DISP_H};
     level = 0;
-    tft.begin();
-    tft.setTitle("Breakout II");
-    tft.setButton1("Auto");    // T1 = autoplay mode
-    tft.setButton2("Player");  // T2 = player mode
-    ts.begin(TOUCH_MODE_RESISTIVE, TOUCH_INTERVAL_MS);
+    initDisplay();
     newGame(&games[0], &state);
 }
 
-// ── loop() ────────────────────────────────────────────────────────────────────
-
-int selection = -1;
+// ── Loop ──────────────────────────────────────────────────────────────────────
 
 void loop()
 {
     uint32_t frameStart = millis();
 
-    // Print messages from loop() — avoids dual-core Serial interleave
+    // Print deferred messages — safe here on core 1
     if (_autoPlayMsg == 1) { Serial.println("[Game] Auto-play ON");  _autoPlayMsg = 0; }
     if (_autoPlayMsg == 2) { Serial.println("[Game] Player mode ON"); _autoPlayMsg = 0; }
-    if (_connIntervalMs > 0) { Serial.printf("[BLE] Interval: %.1fms\n", _connIntervalMs); _connIntervalMs = 0; }
+    if (_connIntervalMs > 0) {
+        Serial.printf("[BLE] Interval: %.1fms\n", _connIntervalMs);
+        _connIntervalMs = 0;
+    }
 
-    // Print BC stats when key counts change.
-    // bc counts (s.key1/2) = incremented in dispatch() on core 0.
-    // app counts (_appKey1/2) = incremented in _keyCallback on core 0,
-    //   same call stack as dispatch(). Should ALWAYS match bc counts.
-    //   A mismatch means _keyCallback didn't fire despite dispatch() running.
+#if DEBUG
+    // Back-channel diagnostic counters — useful during testing, off in release.
+    // syncErrors: bytes discarded before a valid frame start was found.
+    // overruns:   frame longer than parser buffer (should never happen).
+    // invalidFrames: frame with bad length field.
+    // unknownCmds: unrecognised command byte from iPhone.
     static uint32_t lastKey1 = 0, lastKey2 = 0;
     auto s = transport.bcStats();
     if (s.key1 != lastKey1 || s.key2 != lastKey2) {
-        bool mismatch = (s.key1 != (uint32_t)_appKey1 || s.key2 != (uint32_t)_appKey2);
-        Serial.printf("[BC] K1=%u/%u K2=%u/%u touch=%u sync=%u overrun=%u invalid=%u unknown=%u%s\n",
-                      s.key1, (uint32_t)_appKey1, s.key2, (uint32_t)_appKey2,
-                      s.touch, s.syncErrors, s.overruns, s.invalidFrames, s.unknownCmds,
-                      mismatch ? " *** CB MISMATCH ***" : "");
+        Serial.printf("[BC] K1=%u K2=%u touch=%u sync=%u overrun=%u invalid=%u unknown=%u\n",
+                      s.key1, s.key2, s.touch,
+                      s.syncErrors, s.overruns, s.invalidFrames, s.unknownCmds);
         lastKey1 = s.key1;
         lastKey2 = s.key2;
     }
+#endif
 
-    // Paused — connection lost, spin quietly until reconnect
-    if (_paused) {
-        delay(100);
-        return;
-    }
+    // Paused — disconnected, spin quietly until reconnect
+    if (_paused) { delay(100); return; }
 
-    // Redraw requested by iPhone after reconnect
-    if (drawPending) {
-        drawPending = false;
+    // Reconnect — rebuild full display from current game state
+    if (_drawPending) {
+        _drawPending = false;
         Serial.println("[Game] Reconnected — redrawing");
         flash.state = FLASH_NONE;
-        tft.begin();
-        tft.setTitle("Breakout II");
-        tft.setButton1("Auto");
-        tft.setButton2("Player");
-        ts.begin(TOUCH_MODE_RESISTIVE, TOUCH_INTERVAL_MS);
+        initDisplay();
         redrawFullScreen();
         return;
     }
 
-    // 1. Read touch — always first, before any BLE sends
+    // 1. Read touch — always before any BLE sends
     state.playerxold = state.playerx;
-    selection = readUiSelection(game, &state, selection);
+    readUiSelection(game, &state);
 
     // 2. Advance brick flash state machine
     if (flash.state != FLASH_NONE) {
@@ -260,7 +244,7 @@ void loop()
             drawBrick(&state, flash.x, flash.y, BLUE);
             flash.state = FLASH_BLUE;
         } else {
-            // FLASH_BLUE — remove brick
+            // FLASH_BLUE — remove brick and award points
             drawBrick(&state, flash.x, flash.y, backgroundColor);
             unsetBrick(state.wallState, flash.x, flash.y);
             state.score += flash.score;
@@ -287,7 +271,7 @@ void loop()
         state.vely = (int)((20 + (state.score >> 3)) * SPEED_MULTIPLIER) * ((state.vely > 0) - (state.vely < 0));
     }
 
-    // 4. Draw ball and player together — batched into one BLE notification
+    // 4. Draw ball and player — batched before flush
     drawBall((int16_t)(state.ballx >> game->exponent), (int16_t)(state.bally >> game->exponent),
              (int16_t)(state.ballxold >> game->exponent), (int16_t)(state.ballyold >> game->exponent),
              game->ballsize);
@@ -297,7 +281,7 @@ void loop()
     state.ballyold   = state.bally;
 
     // 5. Flush frame to iPhone
-    tft.flush();
+    display.flush();
 
     // 6. Level / game-over transitions
     if (flash.state == FLASH_NONE) {
@@ -315,13 +299,26 @@ void loop()
     }
 
     // 7. Frame budget — spin-wait for remainder of FRAME_MS
-    // delay(1) inside loop yields to BLE stack and IDLE task
-    if (DEBUG) {
+    // delay(1) yields to FreeRTOS so BLE drain task and IDLE get CPU time
+#if DEBUG
+    {
         uint32_t elapsed = millis() - frameStart;
         if (elapsed > FRAME_MS)
             Serial.printf("[Frame] overrun: %ums\n", elapsed);
     }
+#endif
     while (millis() - frameStart < FRAME_MS) delay(1);
+}
+
+// ── Display session ───────────────────────────────────────────────────────────
+
+void initDisplay()
+{
+    display.begin(DISP_W, DISP_H);
+    display.setTitle("Breakout III");
+    display.setButton1("Auto");    // T1 — autoplay mode
+    display.setButton2("Player");  // T2 — player control
+    ts.begin(TOUCH_MODE_RESISTIVE, TOUCH_INTERVAL_MS);
 }
 
 // ── Game functions ────────────────────────────────────────────────────────────
@@ -330,31 +327,31 @@ void newGame(game_type* g, game_state_type* s)
 {
     game = g;
     setupState(game, s);
-    clearDialog();
+    clearScreen();
     updateLives(game->lives, s->remainingLives);
     updateScore(s->score);
     setupWall(game, s);
-    tft.flush();
+    display.flush();
     touchToStart();
-    clearDialog();
+    clearScreen();
     updateLives(game->lives, s->remainingLives);
     updateScore(s->score);
     setupWall(game, s);
-    tft.flush();
+    display.flush();
 }
 
 void setupStateSizes(game_type* g, game_state_type* s)
 {
-    s->bottom      = tft.height() - 30;
-    s->brickwidth  = tft.width()  / g->columns;
-    s->brickheight = tft.height() / 24;
+    s->bottom      = DISP_H - 30;
+    s->brickwidth  = DISP_W / g->columns;
+    s->brickheight = DISP_H / 24;
 }
 
 void setupState(game_type* g, game_state_type* s)
 {
     setupStateSizes(g, s);
     for (int i = 0; i < g->rows; i++) s->wallState[i] = 0;
-    s->playerx        = tft.width() / 2 - g->playerwidth / 2;
+    s->playerx        = DISP_W / 2 - g->playerwidth / 2;
     s->remainingLives = g->lives;
     s->bally          = s->bottom << g->exponent;
     s->ballyold       = s->bottom << g->exponent;
@@ -365,13 +362,13 @@ void setupState(game_type* g, game_state_type* s)
 
 void updateLives(int lives, int remaining)
 {
-    for (int i = 0; i < lives;     i++) tft.fillCircle((1+i)*15, 15, 5, BLACK);
-    for (int i = 0; i < remaining; i++) tft.fillCircle((1+i)*15, 15, 5, YELLOW);
+    for (int i = 0; i < lives;     i++) display.fillCircle((1+i)*15, 15, 5, BLACK);
+    for (int i = 0; i < remaining; i++) display.fillCircle((1+i)*15, 15, 5, YELLOW);
 }
 
 void setupWall(game_type* g, game_state_type* s)
 {
-    int colors[] = {RED,RED,BLUE,BLUE,YELLOW,YELLOW,GREEN,GREEN};
+    int colors[] = {RED, RED, BLUE, BLUE, YELLOW, YELLOW, GREEN, GREEN};
     s->walltop    = g->top + 40;
     s->wallbottom = s->walltop + g->rows * s->brickheight;
     for (int i = 0; i < g->rows; i++)
@@ -384,11 +381,11 @@ void setupWall(game_type* g, game_state_type* s)
 
 void drawBrick(game_state_type* s, int xBrick, int yRow, uint16_t color)
 {
-    tft.fillRect((s->brickwidth * xBrick) + game->brickGap,
-                  s->walltop + (s->brickheight * yRow) + game->brickGap,
-                  s->brickwidth  - game->brickGap * 2,
-                  s->brickheight - game->brickGap * 2,
-                  color);
+    display.fillRect((s->brickwidth * xBrick) + game->brickGap,
+                      s->walltop + (s->brickheight * yRow) + game->brickGap,
+                      s->brickwidth  - game->brickGap * 2,
+                      s->brickheight - game->brickGap * 2,
+                      color);
 }
 
 boolean noBricks(game_type* g, game_state_type* s)
@@ -399,38 +396,36 @@ boolean noBricks(game_type* g, game_state_type* s)
 
 void drawPlayer(game_type* g, game_state_type* s)
 {
-    tft.fillRect(s->playerx, s->bottom, g->playerwidth, g->playerheight, YELLOW);
+    display.fillRect(s->playerx, s->bottom, g->playerwidth, g->playerheight, YELLOW);
     if (s->playerx < s->playerxold)
-        tft.fillRect(s->playerx + g->playerwidth, s->bottom,
-                     abs(s->playerx - s->playerxold), g->playerheight, backgroundColor);
+        display.fillRect(s->playerx + g->playerwidth, s->bottom,
+                         abs(s->playerx - s->playerxold), g->playerheight, backgroundColor);
     else if (s->playerx > s->playerxold)
-        tft.fillRect(s->playerxold, s->bottom,
-                     abs(s->playerx - s->playerxold), g->playerheight, backgroundColor);
+        display.fillRect(s->playerxold, s->bottom,
+                         abs(s->playerx - s->playerxold), g->playerheight, backgroundColor);
 }
 
 void drawBall(int x, int y, int xold, int yold, int ballsize)
 {
-    if      (xold<=x && yold<=y) { tft.fillRect(xold,yold,ballsize,y-yold,BLACK); tft.fillRect(xold,yold,x-xold,ballsize,BLACK); }
-    else if (xold>=x && yold>=y) { tft.fillRect(x+ballsize,yold,xold-x,ballsize,BLACK); tft.fillRect(xold,y+ballsize,ballsize,yold-y,BLACK); }
-    else if (xold<=x && yold>=y) { tft.fillRect(xold,yold,x-xold,ballsize,BLACK); tft.fillRect(xold,y+ballsize,ballsize,yold-y,BLACK); }
-    else                         { tft.fillRect(xold,yold,ballsize,y-yold,BLACK); tft.fillRect(x+ballsize,yold,xold-x,ballsize,BLACK); }
-    tft.fillRect(x, y, ballsize, ballsize, YELLOW);
+    if      (xold<=x && yold<=y) { display.fillRect(xold,yold,ballsize,y-yold,BLACK); display.fillRect(xold,yold,x-xold,ballsize,BLACK); }
+    else if (xold>=x && yold>=y) { display.fillRect(x+ballsize,yold,xold-x,ballsize,BLACK); display.fillRect(xold,y+ballsize,ballsize,yold-y,BLACK); }
+    else if (xold<=x && yold>=y) { display.fillRect(xold,yold,x-xold,ballsize,BLACK); display.fillRect(xold,y+ballsize,ballsize,yold-y,BLACK); }
+    else                         { display.fillRect(xold,yold,ballsize,y-yold,BLACK); display.fillRect(x+ballsize,yold,xold-x,ballsize,BLACK); }
+    display.fillRect(x, y, ballsize, ballsize, YELLOW);
 }
 
-// Start flash — called from checkCornerCollision
-// Does NOT remove brick or update score yet — flash state machine handles that
 void startBrickFlash(game_state_type* s, int xBrick, int yRow)
 {
     flash.state = FLASH_WHITE;
     flash.x     = xBrick;
     flash.y     = yRow;
     flash.score = pointsForRow[yRow];
-    drawBrick(s, xBrick, yRow, WHITE);  // white this frame
+    drawBrick(s, xBrick, yRow, WHITE);
 }
 
 void checkBrickCollision(game_type* g, game_state_type* s, int16_t x, int16_t y)
 {
-    if (flash.state != FLASH_NONE) return;  // already flashing a brick
+    if (flash.state != FLASH_NONE) return;
     int x1 = x + g->ballsize, y1 = y + g->ballsize;
     int hits = checkCornerCollision(g,s,x, y)
              + checkCornerCollision(g,s,x1,y1)
@@ -447,8 +442,7 @@ void checkBrickCollision(game_type* g, game_state_type* s, int16_t x, int16_t y)
 int checkCornerCollision(game_type* g, game_state_type* s, int16_t x, int16_t y)
 {
     if (flash.state != FLASH_NONE) return 0;
-    // Only check if coordinates are within brick wall area
-    if (x < 0 || x >= tft.width()) return 0;
+    if (x < 0 || x >= DISP_W) return 0;
     if (y > s->walltop && y < s->wallbottom) {
         int yRow = (y - s->walltop) / s->brickheight;
         int xCol = x / s->brickwidth;
@@ -464,24 +458,22 @@ int checkCornerCollision(game_type* g, game_state_type* s, int16_t x, int16_t y)
 
 void checkBorderCollision(game_type* g, game_state_type* s, int16_t x, int16_t y)
 {
-    int16_t sw = (int16_t)tft.width();
-
-    // Right wall — ball right edge past screen right
-    if (x + g->ballsize >= sw) {
+    // Right wall
+    if (x + g->ballsize >= DISP_W) {
         s->velx = -abs(s->velx);
-        s->ballx = (int32_t)(sw - g->ballsize - 1) << g->exponent;
+        s->ballx = (int32_t)(DISP_W - g->ballsize - 1) << g->exponent;
     }
-    // Left wall — ball left edge past screen left
+    // Left wall
     if (x < 0) {
         s->velx = abs(s->velx);
         s->ballx = 0;
     }
-    // Top wall — ball top edge in score area
+    // Top wall — ball enters score area
     if (y <= SCORE_SIZE) {
         s->vely = abs(s->vely);
         s->bally = (int32_t)(SCORE_SIZE + 1) << g->exponent;
     }
-    // Paddle — ball bottom edge overlaps paddle vertically and horizontally
+    // Paddle
     if ((y + g->ballsize) >= s->bottom
         && (y + g->ballsize) <= (s->bottom + g->playerheight)
         && x + g->ballsize >= s->playerx
@@ -501,28 +493,56 @@ void checkBallCollisions(game_type* g, game_state_type* s, int16_t x, int16_t y)
 
 void checkBallExit(game_type* g, game_state_type* s, int16_t x, int16_t y)
 {
-    if (y + g->ballsize >= tft.height()) {
+    if (y + g->ballsize >= DISP_H) {
         s->remainingLives--;
         updateLives(g->lives, s->remainingLives);
-        tft.flush();
+        display.flush();
         s->vely = -abs(s->vely);
-        // Clamp back inside screen
-        s->bally = (int32_t)(tft.height() - g->ballsize - 1) << g->exponent;
+        s->bally = (int32_t)(DISP_H - g->ballsize - 1) << g->exponent;
     }
+}
+
+// ── Text helpers ──────────────────────────────────────────────────────────────
+
+// drawBoxedString — clears a background rect then draws text using native print().
+//
+// ESP32PhoneDisplay has no getTextBounds() — it does not subclass Adafruit_GFX.
+// Background rect dimensions use the fixed default font metrics:
+//   width  = strlen × 6 × textSize  (5px glyph + 1px gap, per character)
+//   height = 8 × textSize
+// This is accurate for the built-in font and sufficient for clearing backgrounds.
+void drawBoxedString(int16_t x, int16_t y, const char* str,
+                     uint8_t textSize, uint16_t foreColor, uint16_t bgColor)
+{
+    uint16_t w = (uint16_t)(strlen(str) * 6 * textSize);
+    uint16_t h = (uint16_t)(8 * textSize);
+    display.fillRect(x, y, w, h, bgColor);
+    display.setCursor(x, y);
+    display.setTextColor(foreColor);
+    display.setTextSize(textSize);
+    display.print(str);
 }
 
 void updateScore(int score)
 {
     char buffer[5];
     snprintf(buffer, sizeof(buffer), scoreFormat, score);
-    drawBoxedString(tft.width() - 50, 6, buffer, 2, YELLOW, PRIMARY_DARK_COLOR);
+    drawBoxedString(DISP_W - 50, 6, buffer, 2, YELLOW, PRIMARY_DARK);
+}
+
+// ── Screen helpers ────────────────────────────────────────────────────────────
+
+void clearScreen()
+{
+    display.fillRect(0, 0, DISP_W, DISP_H, backgroundColor);
+    display.fillRect(0, 0, DISP_W, SCORE_SIZE, PRIMARY_DARK);
 }
 
 void touchToStart()
 {
     drawBoxedString(0, 200, "   BREAKOUT",      3, YELLOW, BLACK);
     drawBoxedString(0, 240, "  TOUCH TO START", 2, RED,    BLACK);
-    tft.flush();
+    display.flush();
     while (waitForTouch() < 0) delay(20);
 }
 
@@ -530,26 +550,32 @@ void gameOverTouchToStart()
 {
     drawBoxedString(0, 180, "  GAME OVER",      3, YELLOW, BLACK);
     drawBoxedString(0, 220, "  TOUCH TO START", 2, RED,    BLACK);
-    tft.flush();
+    display.flush();
     while (waitForTouch() < 0) delay(20);
 }
 
-void drawBoxedString(uint16_t x, uint16_t y, const char* str,
-                     uint16_t fontsize, uint16_t foreColor, uint16_t bgColor)
-{
-    tft.setTextSize(fontsize);
-    int16_t x1, y1; uint16_t w, h;
-    tft.getTextBounds(str, x, y, &x1, &y1, &w, &h);
-    tft.fillRect(x, y, w, h, bgColor);
-    tft.setCursor(x, y);
-    tft.setTextColor(foreColor);
-    tft.print(str);
-}
+// ── Redraw ────────────────────────────────────────────────────────────────────
+// Reconstructs full display from current game state after reconnect.
 
-void clearDialog()
+void redrawFullScreen()
 {
-    tft.fillRect(gameSize.x, gameSize.y, gameSize.width, gameSize.height, backgroundColor);
-    tft.fillRect(gameSize.x, gameSize.y, gameSize.width, SCORE_SIZE, PRIMARY_DARK_COLOR);
+    clearScreen();
+    updateLives(game->lives, state.remainingLives);
+    updateScore(state.score);
+
+    int colors[] = {RED, RED, BLUE, BLUE, YELLOW, YELLOW, GREEN, GREEN};
+    for (int i = 0; i < game->rows; i++)
+        for (int j = 0; j < game->columns; j++)
+            if (isBrickIn(state.wallState, j, i))
+                drawBrick(&state, j, i, colors[i]);
+
+    drawBall((int16_t)(state.ballx >> game->exponent),
+             (int16_t)(state.bally >> game->exponent),
+             (int16_t)(state.ballx >> game->exponent),
+             (int16_t)(state.bally >> game->exponent),
+             game->ballsize);
+    drawPlayer(game, &state);
+    display.flush();
 }
 
 // ── Brick helpers ─────────────────────────────────────────────────────────────
@@ -557,51 +583,18 @@ void    setBrick(int wall[], uint8_t x, uint8_t y)   { wall[y] |=  BIT_MASK[x]; 
 void    unsetBrick(int wall[], uint8_t x, uint8_t y) { wall[y] &= ~BIT_MASK[x]; }
 boolean isBrickIn(int wall[], uint8_t x, uint8_t y)  { return wall[y] & BIT_MASK[x]; }
 
-// ── Redraw ───────────────────────────────────────────────────────────────────
-// Reconstructs the full display from current game state after reconnect.
-// Called from loop() when drawPending is set by onRedrawRequest.
-
-void redrawFullScreen()
-{
-    // Background and score bar
-    tft.fillRect(gameSize.x, gameSize.y, gameSize.width, gameSize.height, backgroundColor);
-    tft.fillRect(gameSize.x, gameSize.y, gameSize.width, SCORE_SIZE, PRIMARY_DARK_COLOR);
-
-    // Lives and score
-    updateLives(game->lives, state.remainingLives);
-    updateScore(state.score);
-
-    // Remaining bricks
-    int colors[] = {RED, RED, BLUE, BLUE, YELLOW, YELLOW, GREEN, GREEN};
-    for (int i = 0; i < game->rows; i++)
-        for (int j = 0; j < game->columns; j++)
-            if (isBrickIn(state.wallState, j, i))
-                drawBrick(&state, j, i, colors[i]);
-
-    // Ball and paddle
-    drawBall((int16_t)(state.ballx >> game->exponent),
-             (int16_t)(state.bally >> game->exponent),
-             (int16_t)(state.ballx >> game->exponent),
-             (int16_t)(state.bally >> game->exponent),
-             game->ballsize);
-    drawPlayer(game, &state);
-
-    tft.flush();
-}
-
 // ── Touch ─────────────────────────────────────────────────────────────────────
 
-int readUiSelection(game_type* g, game_state_type* s, int16_t lastSelected)
+void readUiSelection(game_type* g, game_state_type* s)
 {
     if (_autoPlay) {
         s->playerx = (s->ballx >> g->exponent) - g->playerwidth / 2;
-        if (s->playerx >= tft.width() - g->playerwidth)
-            s->playerx = tft.width() - g->playerwidth;
+        if (s->playerx >= DISP_W - g->playerwidth) s->playerx = DISP_W - g->playerwidth;
         if (s->playerx < 0) s->playerx = 0;
-        return 1;
+        return;
     }
 
-    // Drain queue — use last (newest) point for paddle
+    // Drain touch queue — use last (newest) point for paddle position
     TSPoint tp;
     bool    touched = false;
     while (ts.available()) {
@@ -611,18 +604,15 @@ int readUiSelection(game_type* g, game_state_type* s, int16_t lastSelected)
     if (touched) {
         int16_t newX = tp.x - g->playerwidth / 2;
         if (newX < 0) newX = 0;
-        if (newX >= tft.width() - g->playerwidth)
-            newX = tft.width() - g->playerwidth;
+        if (newX >= DISP_W - g->playerwidth) newX = DISP_W - g->playerwidth;
         s->playerx = newX;
-        return 1;
     }
-    return -1;
 }
 
 int waitForTouch()
 {
     if (_paused)     return -1;   // disconnected — keep waiting
-    if (drawPending) return 1;
+    if (_drawPending) return 1;   // reconnected — exit wait loop
     if (_autoPlay) {
         static uint32_t autoStart = 0;
         if (autoStart == 0) autoStart = millis();

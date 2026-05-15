@@ -123,6 +123,81 @@ void setup() {
 The API is identical to Adafruit_GFX except `Adafruit_GFX*` pointer
 compatibility is lost. If you need that, stay on `ESP32PhoneDisplay_Compat`.
 
+### When compat mode overhead matters
+
+The performance impact of compat mode depends on how many commands a frame
+generates, and how those commands fill BLE packets.
+
+**BLE packet capacity:** Each BLE notification carries up to 252 bytes
+(MTU 255 − 3 bytes ATT header). Every GFX command has 4 bytes of framing
+overhead plus its payload. At a 15ms connection interval, one packet drains
+per interval — so packet count directly determines frame time.
+
+**Native mode — compact commands:**
+A `fillRoundRect` or `drawRoundRect` is always one command regardless of
+size. `print()` sends one `GFX_CMD_WRITE_CHAR` per character; the iPhone
+renders each glyph. A typical button (fill + outline + 5-char label) generates
+~10 commands and fits in a single packet — drains in one interval (~15ms).
+
+**Compat mode — decomposed commands:**
+`fillRoundRect`, `drawRoundRect`, and text rendering decompose to
+`drawFastHLine` and `drawPixel` calls via Adafruit_GFX's non-virtual base.
+A 180×50 rounded button with a 3-character label at textSize 2 generates
+roughly 200 commands — 8–10 packets. At 15ms per interval that's 120–150ms
+per button draw.
+
+**The batching effect:**
+Commands from all drawing calls accumulate in the BLE stream buffer and drain
+together before `flush()`. When the total frame command count fits in 1–2
+packets (≤504 bytes), compat overhead is negligible — the slow commands are
+carried along in the same batch as fast ones and the frame still drains in
+one interval. As compat command count grows, each additional packet adds one
+full connection interval to frame time.
+
+| Frame total   | Drain time (15ms interval) | Perceived         |
+|---------------|----------------------------|-------------------|
+| 1–2 packets   | 15–30ms                    | Imperceptible     |
+| 3–5 packets   | 45–75ms                    | Slightly sluggish |
+| 10+ packets   | 150ms+                     | Visibly slow      |
+
+### Mixing compat and native in one sketch
+
+If you need `Adafruit_GFX*` compatibility for one thing (e.g. a third-party
+button library) but want native performance for everything else, hold both
+objects against the same transport simultaneously:
+
+```cpp
+BleTransport             transport;
+ESP32PhoneDisplay_Compat tft(transport, 240, 320);  // for Adafruit_GFX_Button
+ESP32PhoneDisplay        display(transport);         // for fast drawing
+
+void setup() {
+    transport.begin();
+    while (!transport.canSend()) { delay(100); }
+
+    tft.begin();          // establishes phone session — call once only
+    // display.begin() intentionally omitted — a second GFX_CMD_BEGIN would
+    // reset the phone session. display shares the session tft.begin() created.
+
+    // Compat path — slow, needed for Adafruit_GFX_Button
+    someButton.initButtonUL(&tft, ...);
+    someButton.drawButton(false);
+
+    // Native path — fast, for everything else
+    display.fillRoundRect(20, 140, 180, 50, 8, 0x03E0);
+    display.setCursor(50, 158);
+    display.setTextColor(0xFFFF);
+    display.print("Native text");
+
+    tft.flush();          // flush via either object — both wake the drain task
+}
+```
+
+Commands from both objects flow into the same BLE stream in call order.
+`getTextBounds()` for text centering math should be called on `tft` — it is
+pure local Adafruit_GFX arithmetic and sends no BLE commands. `ESP32PhoneDisplay`
+has no equivalent since it does not subclass Adafruit_GFX.
+
 ### Display size
 
 Physical TFTs have fixed resolutions (128x160, 240x320, etc.).
