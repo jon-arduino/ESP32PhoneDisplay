@@ -140,11 +140,13 @@ Set a volatile flag and act on it in `loop()` instead. See the examples and
 the logging note in the main README for details.
 
 ```cpp
-// Called at the GATT level on BLE connect (ready=true) or disconnect (ready=false).
-// Set _drawPending on connect as a reliable fallback — onRedrawRequest may not fire
-// on all app versions. Both setting _drawPending is safe; a double-draw is harmless.
-// Use the disconnect case (ready=false) to pause drawing.
-transport.onSubscribed([](bool ready) { ... });
+// Called when BLE connects. Use as fallback draw trigger if onDisplayAvailable
+// doesn't fire first. A double-draw if both fire is harmless.
+transport.onConnected([]() { ... });
+
+// Called when BLE drops. Sets display offline immediately — on an abrupt drop,
+// onDisplayAvailable(false) may not arrive from the app.
+transport.onDisconnected([]() { ... });
 
 // Called when iPhone presses T1 (key='1') or T2 (key='2') toolbar button.
 transport.onKey([](uint8_t key) { ... });
@@ -175,21 +177,20 @@ The display state is unknown. The app sends `BC_CMD_REDRAW_REQUEST` on
 foreground so the ESP32 can rebuild a coherent display — even though BLE
 was never dropped.
 
-`onSubscribed(true)` alone cannot cover case 2. If you want the display to
-stay correct across reconnects and app switching, register `onRedrawRequest`
-and rebuild your full screen there:
+`onConnected` alone cannot cover case 2. Register `onDisplayAvailable` and
+`onRedrawRequest` together for complete coverage:
 
 ```cpp
+transport.onDisplayAvailable([](bool available) {
+    if (available) { _displayOffline = false; _redrawPending = true; }
+    else             _displayOffline = true;
+});
 transport.onRedrawRequest([]() {
-    _drawPending = true;    // set flag — act in loop(), not here
+    _redrawPending = true;    // set flag — act in loop(), not here
 });
-
-// onSubscribed sets _drawPending too as a reliable fallback —
-// onRedrawRequest may not fire on all app versions. Double-draw is harmless.
-transport.onSubscribed([](bool ready) {
-    if (ready) { _paused = false; _drawPending = true; }
-    else       { _paused = true; }
-});
+// onConnected as fallback draw trigger, onDisconnected as safety net
+transport.onConnected([]()    { _redrawPending = true; });
+transport.onDisconnected([]() { _displayOffline = true; });
 ```
 
 For static displays that never update, `onRedrawRequest` is still recommended

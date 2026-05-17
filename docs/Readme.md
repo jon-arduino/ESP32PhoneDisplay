@@ -44,20 +44,26 @@ Install all three via the Arduino Library Manager or PlatformIO before using thi
 BleTransport      transport;
 ESP32PhoneDisplay display(transport);
 
-static volatile bool _drawPending = false;
+static volatile bool _redrawPending  = false;
+static volatile bool _displayOffline = false;
 
 void setup() {
-    // onRedrawRequest — sent after reconnect and when app returns from background.
-    // Rebuild full display here. Never call display from a callback — set a flag.
-    // See docs/transport.md for full explanation.
-    transport.onRedrawRequest([]() { _drawPending = true; });
-    transport.onSubscribed([](bool ready) { if (!ready) _drawPending = false; });
+    transport.setDeviceName("MyESP32");   // appears in app BLE device list
+
+    transport.onDisplayAvailable([](bool available) {
+        if (available) { _displayOffline = false; _redrawPending = true; }
+        else             _displayOffline = true;
+    });
+    transport.onRedrawRequest([]() { _redrawPending = true; });
+    transport.onConnected([]()     { _redrawPending = true; });
+    transport.onDisconnected([]()  { _displayOffline = true; });
     transport.begin();
 }
 
 void loop() {
-    if (_drawPending) {
-        _drawPending = false;
+    if (_displayOffline) { delay(100); return; }
+    if (_redrawPending) {
+        _redrawPending = false;
         display.begin(240, 320);
         display.fillScreen(0x0000);
         display.setCursor(20, 140);
@@ -69,7 +75,7 @@ void loop() {
 }
 ```
 
-Open the RemoteGraphics app on your iPhone, tap **BLE**, select **ESP32-Display** — your message appears instantly.
+Open the RemoteGraphics app on your iPhone, tap **BLE**, select **MyESP32** — your message appears instantly.
 
 ### WiFi Example
 
@@ -80,15 +86,25 @@ Open the RemoteGraphics app on your iPhone, tap **BLE**, select **ESP32-Display*
 WiFiTransport     transport("your_ssid", "your_password");
 ESP32PhoneDisplay display(transport);
 
+static volatile bool _redrawPending  = false;
+static volatile bool _displayOffline = false;
+
 void setup() {
-    transport.onRedrawRequest([]() { _drawPending = true; });
-    transport.onConnected([]()    { _drawPending = true; });
+    transport.setDeviceName("MyESP32");   // mDNS: MyESP32.local
+    transport.onDisplayAvailable([](bool available) {
+        if (available) { _displayOffline = false; _redrawPending = true; }
+        else             _displayOffline = true;
+    });
+    transport.onRedrawRequest([]() { _redrawPending = true; });
+    transport.onConnected([]()     { _redrawPending = true; });
+    transport.onDisconnected([]()  { _displayOffline = true; });
     transport.begin();
 }
 
 void loop() {
-    if (_drawPending) {
-        _drawPending = false;
+    if (_displayOffline) { delay(100); return; }
+    if (_redrawPending) {
+        _redrawPending = false;
         display.begin(240, 320);
         display.fillScreen(0x001F);
         display.flush();
@@ -180,7 +196,15 @@ void cp437(bool enable = true);
 
 #### Colors
 
-Colors are 16-bit RGB565, same as Adafruit_GFX:
+Colors are 16-bit RGB565, same as Adafruit_GFX. Include `Colors.h` for the
+full set of named constants plus Adafruit driver aliases (ST77XX_*, ILI9341_*,
+HX8357_*, SSD1351_*):
+
+```cpp
+#include <Colors.h>   // replaces Adafruit display driver color constants
+```
+
+Or define your own:
 
 ```cpp
 #define BLACK   0x0000
@@ -191,6 +215,7 @@ Colors are 16-bit RGB565, same as Adafruit_GFX:
 #define YELLOW  0xFFE0
 #define CYAN    0x07FF
 #define MAGENTA 0xF81F
+// ... see Colors.h for full list including NAVY, ORANGE, PINK, GREY, etc.
 ```
 
 ---
@@ -206,16 +231,29 @@ BleTransport transport;
 #### Setup
 
 ```cpp
-void begin();                            // start BLE advertising
+void begin();   // start BLE advertising
 
-// Called at GATT level on BLE connect (true) or disconnect (false).
-// Use disconnect case to pause drawing. Prefer onRedrawRequest for rebuilds.
-void onSubscribed(std::function<void(bool)> cb);
+// Set BLE advertising name. Default: "ESP32-Display".
+// Call before begin(). Use unique names for multi-device deployments.
+void setDeviceName(const char* name);
 
-// Called after BLE reconnect and when app returns from background.
-// The iPhone's framebuffer persists across disconnect — use this to rebuild
-// the full display whenever its state may be unknown. See docs/transport.md.
+// Called when display becomes available (true) or offline (false).
+// available=true: fires ~100ms after connect and on app foreground return.
+// available=false: fires on app background, phone lock, or disconnect.
+// Primary signal for pausing/resuming drawing. See docs/transport.md.
+void onDisplayAvailable(std::function<void(bool)> cb);
+
+// Called after app returns from background — display state may be stale.
+// Also fires on BLE reconnect in some app versions. See docs/transport.md.
 void onRedrawRequest(std::function<void()> cb);
+
+// Called when BLE connection is established at the transport level.
+// Use as fallback draw trigger if onDisplayAvailable doesn't fire.
+void onConnected(std::function<void()> cb);
+
+// Called when BLE connection drops. Sets display offline immediately —
+// on an abrupt drop, onDisplayAvailable(false) may not arrive from the app.
+void onDisconnected(std::function<void()> cb);
 
 // Called when iPhone presses T1 (key='1') or T2 (key='2') in the app
 void onKey(std::function<void(uint8_t key)> cb);
@@ -261,6 +299,8 @@ void resetBcStats();
 | `key1`, `key2` | T1/T2 button presses received |
 | `touch` | Touch events received |
 | `pong` | Ping responses received |
+| `redrawRequests` | BC_CMD_REDRAW_REQUEST received |
+| `displayAvailable` | BC_CMD_DISPLAY_AVAILABLE received |
 | `syncErrors` | Bytes discarded waiting for frame start |
 | `overruns` | Buffer overrun resets |
 | `invalidFrames` | Frames with invalid length field |
@@ -282,11 +322,18 @@ WiFiTransport transport("ssid", "password", "hostname", 9000);   // full
 ```cpp
 void begin();
 
+// Set mDNS hostname. Default: "esp32-display" (resolves as esp32-display.local).
+// Call before begin(). Use unique names for multi-device deployments.
+// SoftAP SSID is set separately via setSoftAP().
+void setDeviceName(const char* name);
+
 // Optional SoftAP fallback if STA connection fails
 void setSoftAP(const char *apSsid, const char *apPassword,
                uint32_t staTimeoutMs = 15000);
 
-// Callbacks
+// Callbacks — same semantics as BleTransport
+void onDisplayAvailable(std::function<void(bool)> cb);
+void onRedrawRequest(std::function<void()> cb);
 void onConnected(std::function<void()> cb);
 void onDisconnected(std::function<void()> cb);
 void onKey(std::function<void(uint8_t key)> cb);
@@ -295,8 +342,7 @@ void onKey(std::function<void(uint8_t key)> cb);
 bool isConnected() const;
 bool isInAPMode() const;
 
-// Power management
-// setPowerSave(false) disables WiFi modem sleep for maximum throughput
+// Power management — disables WiFi modem sleep for lower latency
 void setPowerSave(bool enable);   // default true
 ```
 
@@ -338,7 +384,14 @@ DualTransport transport("ssid", "password", "hostname", 9000);   // full
 ```cpp
 void begin();
 
-// Callbacks
+// Set device name for BLE advertising and WiFi mDNS hostname.
+// Default: "ESP32-Display" (BLE) / "esp32-display" (mDNS).
+// SoftAP SSID is set separately via setSoftAP().
+void setDeviceName(const char* name);
+
+// Callbacks — same semantics as BleTransport and WiFiTransport
+void onDisplayAvailable(std::function<void(bool)> cb);
+void onRedrawRequest(std::function<void()> cb);
 void onConnected(std::function<void()> cb);
 void onDisconnected(std::function<void()> cb);
 void onKey(std::function<void(uint8_t key)> cb);
@@ -346,7 +399,7 @@ void onKey(std::function<void(uint8_t key)> cb);
 // Status
 bool        isBleActive()  const;
 bool        isWifiActive() const;
-const char* activeTransportName() const;   // "BLE", "WiFi", or "none"
+const char* activeTransportName() const;   // "ble", "wifi", or "none"
 
 // BLE connection interval (delegates to BleTransport)
 void  setConnectionInterval(uint16_t minMs, uint16_t maxMs);
@@ -358,8 +411,7 @@ void  onConnInterval(std::function<void(float)> cb);
 uint32_t rttLast() / rttMin() / rttMax() / rttAvg() / rttCount();
 void     resetRttStats();
 
-// Power management
-// setPowerSave(false) shuts down BLE when WiFi connects — one-way, no BLE after.
+// Power management — see docs/transport.md for implications on radio switching
 void setPowerSave(bool enable);
 ```
 
@@ -431,19 +483,27 @@ The queue holds 16 points, covering ~256ms of stall at 16ms intervals. A non-zer
 
 ### ESP32PhoneDisplay_Compat
 
-Drop-in replacement for `Adafruit_TFTLCD`. Allows porting existing sketch code with minimal changes.
+`Adafruit_GFX` subclass — only needed when a library requires an
+`Adafruit_GFX*` pointer (e.g. `Adafruit_GFX_Button::initButtonUL()`).
+For all other porting, use native `ESP32PhoneDisplay` directly.
 
 ```cpp
 #include <ESP32PhoneDisplay_Compat.h>
 
-ESP32PhoneDisplay_Compat tft(transport, 240, 320);
+// Dual-object pattern — compat for the pointer, native for your own drawing
+ESP32PhoneDisplay_Compat tft(transport, 240, 320);   // satisfies Adafruit_GFX*
+ESP32PhoneDisplay        display(transport);          // for all your own drawing
 
-tft.begin();            // instead of tft.reset() + tft.begin(id)
-tft.fillScreen(BLACK);  // same as Adafruit_TFTLCD
-tft.flush();            // call at end of frame — no equivalent in hardware driver
+tft.begin();    // establishes session for both — do NOT call display.begin()
+thirdPartyLib.init(&tft);     // pass compat where Adafruit_GFX* required
+display.fillRect(...);        // your drawing via native (fast)
+display.flush();
 ```
 
-Also exposes `getTextBounds()` for text layout calculations.
+Text rendering through compat decomposes each glyph into pixel-level BLE
+commands — significantly more traffic than native. Use native for all drawing
+you control. See the `GFX_Pointer` example for the three approaches to
+`Adafruit_GFX*` compatibility.
 
 ---
 
@@ -474,7 +534,7 @@ public:
 
 ### Logging from BLE Callbacks
 
-BLE callbacks (`onKey`, `onSubscribed`, `onConnInterval`) run on core 0 (the NimBLE host task). `Serial.printf()` is unreliable from this context because the ESP32's UART TX interrupt can be masked by NimBLE internal critical sections and flash cache operations.
+BLE callbacks (`onKey`, `onConnected`, `onDisconnected`, `onConnInterval`) run on core 0 (the NimBLE host task). `Serial.printf()` is unreliable from this context because the ESP32's UART TX interrupt can be masked by NimBLE internal critical sections and flash cache operations.
 
 **Espressif's documented solution** for logging from BLE callbacks is `ESP_DRAM_LOGx`:
 

@@ -212,15 +212,63 @@ Commands from both objects flow into the same BLE stream in call order.
 pure local Adafruit_GFX arithmetic and sends no BLE commands. `ESP32PhoneDisplay`
 has no equivalent since it does not subclass Adafruit_GFX.
 
-### Display size
+### Display size and scaling
 
-Physical TFTs have fixed resolutions (128x160, 240x320, etc.).
-With ESP32PhoneDisplay you choose the virtual display size in `begin(w, h)`.
-The iPhone app scales to fill the screen regardless of resolution.
+Physical TFTs have fixed resolutions (128×160, 240×320, etc.).
+With ESP32PhoneDisplay you choose the virtual canvas size in `begin(w, h)`.
+The iPhone app always scales this canvas to fill the screen — the virtual
+size controls how many drawing coordinates you have, not how large the
+result appears physically. The display is always full screen.
 
-Start with the same size as your original display for minimal code changes.
-Or go larger — 480x640 or 720x1280 cost nothing on the ESP32 and give far
-more screen real estate on a modern iPhone.
+**Resolution — virtual pixel density:**
+
+The iPhone scales the canvas by approximately `screen_size / virtual_size`.
+At low virtual resolution each virtual pixel maps to many physical pixels —
+drawings look blocky. At high resolution each virtual pixel is small —
+drawings are sharp but lines and text may be very fine.
+
+| Virtual size | Effect on iPhone |
+|---|---|
+| 128×160 | ~3× physical pixels per virtual pixel — very blocky. 1px lines look thick. Text at textSize(1) appears large. |
+| 240×320 | ~1.6× — slightly soft. Good baseline. Text readable at textSize(1). |
+| 480×854 | ~0.8× — sharp. 1px lines may be barely visible. Use textSize(2)+ for readability. |
+
+There is no performance cost to choosing a larger virtual canvas — the ESP32
+sends coordinates, not pixels. Choose size based on the visual result you want.
+
+**Aspect ratio — filling the screen:**
+
+The app preserves the virtual canvas aspect ratio and letterboxes
+(black bars) if it doesn't match the iPhone screen. Modern iPhones are
+approximately 9:19.5 portrait (~1:2.16 ratio). Common mismatches:
+
+| Virtual size | Ratio | Result on iPhone 14 (390×844) |
+|---|---|---|
+| 240×320 | 1:1.33 | Significant pillarboxing — wide black bars on sides |
+| 240×480 | 1:2.00 | Close — small letterboxing top/bottom |
+| 240×520 | 1:2.17 | Near edge-to-edge on most iPhones |
+| 320×693 | 1:2.17 | Higher resolution, same fill |
+
+If your original sketch was for a 240×320 TFT, consider increasing the
+height to 480 or 520 to better fill the iPhone screen.
+
+**Line widths:**
+
+All Adafruit_GFX drawing functions use 1-virtual-pixel wide lines —
+there is no line width setting. At low virtual resolution these appear
+thick on screen; at high resolution they appear hairline thin. Choose
+your virtual resolution to get the line weight you want.
+
+**Rotation:**
+
+`setRotation(r)` rotates the virtual canvas (0 = portrait, 1 = landscape
+90° clockwise, 2 = portrait flipped, 3 = landscape 90° counter-clockwise).
+Swap width and height in `begin()` when using landscape:
+
+```cpp
+display.begin(320, 240);   // landscape — wider than tall
+display.setRotation(1);
+```
 
 ### flush()
 
@@ -469,6 +517,25 @@ colour constants that aren't available once you remove the include.
 Use `ESP32PhoneDisplay_Compat` — it's an `Adafruit_GFX` subclass so existing
 libraries accept it.
 
-**Text or shapes are too small:**
-Increase the virtual display size in `begin(w, h)`. A 128x160 virtual display
-on an iPhone will be very small — try 320x480 or larger.
+**Graphics look blocky or pixelated:**
+Your virtual canvas resolution is too low. The iPhone scales the canvas to
+fill the screen — at low resolution each virtual pixel maps to many physical
+pixels. Increase `begin(w, h)` to a larger size. 240×480 or 320×693 are
+good starting points for a portrait iPhone. There is no ESP32 performance
+cost to a larger virtual canvas.
+
+**1-pixel lines are barely visible:**
+Your virtual canvas resolution is too high relative to the iPhone screen.
+Each virtual pixel is smaller than one physical pixel, making 1px lines
+nearly invisible. Either reduce the virtual canvas size, or use
+`fillRect(x, y, w, 2, color)` to draw 2-virtual-pixel wide lines.
+
+**Black bars on sides or top/bottom:**
+Your virtual canvas aspect ratio doesn't match the iPhone screen. Modern
+iPhones are approximately 9:19.5 portrait. A 240×320 canvas (3:4 ratio)
+will have wide black bars on the sides. Try 240×520 or 320×693 for
+near edge-to-edge fill on most iPhones.
+
+**Text is too small to read:**
+Increase `setTextSize()`. At high virtual resolution, textSize(1) characters
+are small. textSize(2) or textSize(3) is more readable on a large iPhone screen.
