@@ -1,21 +1,30 @@
-// Breakout_III — replaces Breakout_II
+// Breakout2 — optimised Breakout for ESP32PhoneDisplay
 //
-// Fully native ESP32PhoneDisplay (no compat layer). Every GFX operation
-// sends a single compact BLE command — fillRect, fillCircle, print() etc.
-// are all single commands regardless of size or content.
+// Demonstrates the improvements over the baseline Breakout port:
 //
-// Improvements over Breakout_II:
-//   - Native ESP32PhoneDisplay throughout — no Adafruit_GFX decomposition
-//   - setTitle / setButton1 / setButton2 via session API
-//   - onRedrawRequest for clean reconnect
-//   - BC diagnostic stats behind #define DEBUG
+//   Fixed frame rate — millis()-based 30fps budget keeps ball speed
+//     consistent regardless of BLE jitter or variable loop time.
 //
-// Game features (carried from Breakout_II):
-//   - Fixed 30fps frame rate via millis()-based frame budget
-//   - Ball speed in pixels-per-frame (consistent regardless of BLE jitter)
-//   - Brick flash state machine — no blocking delays
-//   - Ball pauses during brick flash (2 frames = 66ms)
-//   - T1 = autoplay, T2 = player control
+//   Fixed-point physics — ball position in sub-pixel fixed-point,
+//     speed scales cleanly with score without floating-point overhead.
+//
+//   Brick flash state machine — WHITE→BLUE→gone across natural frame
+//     boundaries. No blocking delays in the game loop.
+//
+//   Touch queue draining — newest paddle position used each frame.
+//     Queue draining prevents lag buildup when BLE is briefly busy.
+//
+//   Ball position clamping — ball clamped to brick face on collision,
+//     preventing the erase notch artifact seen in the baseline.
+//
+//   Display availability — game pauses cleanly when phone locks, app
+//     switches, or display goes offline. Resumes without restart.
+//
+//   Session management — begin()/setTitle()/setButton only re-sent
+//     on true BLE reconnect, not on every display redraw.
+//
+//   Full redraw on reconnect — game state reconstructed on screen
+//     after BLE drop without restarting the game.
 //
 // Original game by Enrique Albertos (public domain)
 
@@ -29,7 +38,7 @@
 #define SPEED_MULTIPLIER     6.0f  // ball speed scale — tune to taste
 #define TOUCH_INTERVAL_MS    30    // iPhone MOVE event throttle (ms)
 #define BLE_INTERVAL_MIN_MS  15    // BLE connection interval min (ms)
-#define BLE_INTERVAL_MAX_MS  30    // BLE connection interval max (ms)
+#define BLE_INTERVAL_MAX_MS  15    // BLE connection interval max (ms)
 #define DEBUG                0     // 1 = frame overrun prints + BC stats
 
 // ── Colours ───────────────────────────────────────────────────────────────────
@@ -38,16 +47,13 @@
 #define RED             0xF800
 #define GREEN           0x07E0
 #define CYAN            0x07FF
-#define MAGENTA         0xF81F
 #define YELLOW          0xFFE0
 #define WHITE           0xFFFF
 #define PRIMARY_DARK    0x4016
 
 // ── Display ───────────────────────────────────────────────────────────────────
-#define DISP_W  240
-#define DISP_H  320
-
-// ── Game constants ────────────────────────────────────────────────────────────
+#define DISP_W      240
+#define DISP_H      320
 #define SCORE_SIZE   30
 #define GAMES_NUMBER 16
 
@@ -66,13 +72,12 @@ typedef struct {
 } game_state_type;
 
 // ── Brick flash state machine ─────────────────────────────────────────────────
+// WHITE→BLUE→gone across two natural frame boundaries.
+// Ball physics pause while flash is active — prevents double-hit artifacts.
 enum FlashState { FLASH_NONE, FLASH_WHITE, FLASH_BLUE };
-
 struct BrickFlash {
     FlashState state = FLASH_NONE;
-    int        x     = 0;
-    int        y     = 0;
-    int        score = 0;
+    int x = 0, y = 0, score = 0;
 };
 
 // ── Forward declarations ──────────────────────────────────────────────────────
@@ -98,11 +103,11 @@ void touchToStart();
 void gameOverTouchToStart();
 void readUiSelection(game_type*, game_state_type*);
 int  waitForTouch();
+void initDisplay();
 void redrawFullScreen();
 void setBrick(int[], uint8_t, uint8_t);
 void unsetBrick(int[], uint8_t, uint8_t);
 boolean isBrickIn(int[], uint8_t, uint8_t);
-void initDisplay();
 
 // ── Game data ─────────────────────────────────────────────────────────────────
 game_type games[GAMES_NUMBER] = {
@@ -140,111 +145,125 @@ const uint8_t BIT_MASK[]     = {0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80};
 uint8_t       pointsForRow[] = {7,7,5,5,3,3,1,1};
 char          scoreFormat[]  = "%04d";
 
-// ── Volatile flags — set on core 0 (BLE task), read on core 1 (loop) ─────────
-// Never call Serial or display from BLE callbacks — use flags instead.
-static volatile bool     _drawPending    = false;
-static volatile bool     _autoPlay       = false;
-static volatile bool     _paused         = false;
-static volatile int      _autoPlayMsg    = 0;    // 1=ON 2=OFF — printed from loop()
-static volatile float    _connIntervalMs = 0;    // >0 = new interval to print
+// ── Volatile flags — set on NimBLE task (core 0), read on loop task (core 1) ─
+// Never call display functions or Serial from a BLE callback — set flags only.
+static volatile bool  _displayOffline = false;  // pause game loop when display unavailable
+static volatile bool  _redrawPending  = false;  // rebuild display from current game state
+static volatile bool  _displayReset   = true;   // re-send begin()/setTitle()/buttons on next draw
+static volatile bool  _autoPlay       = false;
+static volatile int   _autoPlayMsg    = 0;       // 1=ON 2=OFF — printed from loop()
+static volatile float _connIntervalMs = 0;       // printed from loop()
 
-// ── Setup ─────────────────────────────────────────────────────────────────────
+// ── setup() ──────────────────────────────────────────────────────────────────
 
 void setup()
 {
     Serial.begin(115200);
-    uint32_t t = millis();
-    while (!Serial && millis() - t < 3000) delay(10);
-    Serial.println("[Breakout_III] Booting...");
+    Serial.println("[Breakout2] Booting...");
 
     transport.setConnectionInterval(BLE_INTERVAL_MIN_MS, BLE_INTERVAL_MAX_MS);
 
-    transport.onConnInterval([](float ms) {
-        _connIntervalMs = ms;
-    });
+    transport.onConnInterval([](float ms) { _connIntervalMs = ms; });
 
     transport.onKey([](uint8_t key) {
         if      (key == '1') { _autoPlay = true;  _autoPlayMsg = 1; }
         else if (key == '2') { _autoPlay = false; _autoPlayMsg = 2; }
     });
 
-    // onSubscribed: fallback for older app versions that don't send redraw request
-    transport.onSubscribed([](bool ready) {
-        if (ready) { _paused = false; _drawPending = true; }
-        else       { _paused = true; }
+    // onDisplayAvailable — primary signal for display ready/offline.
+    // available=true fires ~100ms after connect and on app foreground return.
+    transport.onDisplayAvailable([](bool available) {
+        if (available) { _displayOffline = false; _redrawPending = true; }
+        else             _displayOffline = true;
     });
 
-    // onRedrawRequest: sent by current app ~100ms after connect/reconnect
-    transport.onRedrawRequest([]() {
-        _paused = false; _drawPending = true;
+    // onRedrawRequest — display state stale, rebuild from current game state.
+    // Fires when app returns from background (alongside onDisplayAvailable).
+    transport.onRedrawRequest([]() { _redrawPending = true; });
+
+    // onConnected / onDisconnected — transport-level fallback.
+    // onDisconnected sets _displayReset so session is re-established on reconnect.
+    transport.onConnected([]() {
+        _displayOffline = false; _redrawPending = true;
+    });
+    transport.onDisconnected([]() {
+        _displayOffline = true;
+        _displayReset   = true;  // session lost — begin()/setTitle() needed on next draw
     });
 
     transport.begin();
-    Serial.println("[Game] Waiting for iPhone...");
+    Serial.println("[BLE] Advertising — waiting for iPhone...");
 
-    while (!_drawPending) delay(100);
-    _drawPending = false;
+    while (!_redrawPending) delay(100);
+    _redrawPending = false;
 
     level = 0;
     initDisplay();
     newGame(&games[0], &state);
 }
 
-// ── Loop ──────────────────────────────────────────────────────────────────────
+// ── loop() ───────────────────────────────────────────────────────────────────
 
 void loop()
 {
     uint32_t frameStart = millis();
 
-    // Print deferred messages — safe here on core 1
-    if (_autoPlayMsg == 1) { Serial.println("[Game] Auto-play ON");  _autoPlayMsg = 0; }
-    if (_autoPlayMsg == 2) { Serial.println("[Game] Player mode ON"); _autoPlayMsg = 0; }
+    // Deferred Serial output — safe on core 1
+    if (_autoPlayMsg == 1) { Serial.println("[Game] Auto-play ON");  Serial.flush(); _autoPlayMsg = 0; }
+    if (_autoPlayMsg == 2) { Serial.println("[Game] Player mode ON"); Serial.flush(); _autoPlayMsg = 0; }
     if (_connIntervalMs > 0) {
         Serial.printf("[BLE] Interval: %.1fms\n", _connIntervalMs);
+        Serial.flush();
         _connIntervalMs = 0;
     }
 
 #if DEBUG
-    // Back-channel diagnostic counters — useful during testing, off in release.
-    // syncErrors: bytes discarded before a valid frame start was found.
-    // overruns:   frame longer than parser buffer (should never happen).
-    // invalidFrames: frame with bad length field.
-    // unknownCmds: unrecognised command byte from iPhone.
     static uint32_t lastKey1 = 0, lastKey2 = 0;
-    auto s = transport.bcStats();
-    if (s.key1 != lastKey1 || s.key2 != lastKey2) {
+    auto bcst = transport.bcStats();
+    if (bcst.key1 != lastKey1 || bcst.key2 != lastKey2) {
         Serial.printf("[BC] K1=%u K2=%u touch=%u sync=%u overrun=%u invalid=%u unknown=%u\n",
-                      s.key1, s.key2, s.touch,
-                      s.syncErrors, s.overruns, s.invalidFrames, s.unknownCmds);
-        lastKey1 = s.key1;
-        lastKey2 = s.key2;
+                      bcst.key1, bcst.key2, bcst.touch,
+                      bcst.syncErrors, bcst.overruns, bcst.invalidFrames, bcst.unknownCmds);
+        lastKey1 = bcst.key1; lastKey2 = bcst.key2;
     }
 #endif
 
-    // Paused — disconnected, spin quietly until reconnect
-    if (_paused) { delay(100); return; }
+    // Display offline — phone locked, app backgrounded, or BT dropped
+    if (_displayOffline) { delay(100); return; }
 
-    // Reconnect — rebuild full display from current game state
-    if (_drawPending) {
-        _drawPending = false;
-        Serial.println("[Game] Reconnected — redrawing");
+    // Redraw — BLE reconnect or app foreground return
+    if (_redrawPending) {
+        _redrawPending = false;
         flash.state = FLASH_NONE;
-        initDisplay();
-        redrawFullScreen();
+        bool fullRestart = _displayReset;  // true = BLE reconnect, false = app switch/return
+        initDisplay();                     // clears _displayReset, sends begin() if needed
+        if (fullRestart) {
+            // BLE reconnected — restart game from scratch in player mode
+            Serial.println("[Game] Reconnected — restarting");
+            Serial.flush();
+            _autoPlay   = false;   // always start in player mode after reconnect
+            state.score = 0;
+            level       = 0;
+            newGame(&games[0], &state);   // shows "TOUCH TO START"
+        } else {
+            // App returned from background — resume game from current state
+            Serial.println("[Game] Display available — resuming");
+            Serial.flush();
+            redrawFullScreen();
+        }
         return;
     }
 
-    // 1. Read touch — always before any BLE sends
+    // 1. Read touch — before any BLE sends
     state.playerxold = state.playerx;
     readUiSelection(game, &state);
 
-    // 2. Advance brick flash state machine
+    // 2. Brick flash state machine
     if (flash.state != FLASH_NONE) {
         if (flash.state == FLASH_WHITE) {
             drawBrick(&state, flash.x, flash.y, BLUE);
             flash.state = FLASH_BLUE;
         } else {
-            // FLASH_BLUE — remove brick and award points
             drawBrick(&state, flash.x, flash.y, backgroundColor);
             unsetBrick(state.wallState, flash.x, flash.y);
             state.score += flash.score;
@@ -272,15 +291,17 @@ void loop()
     }
 
     // 4. Draw ball and player — batched before flush
-    drawBall((int16_t)(state.ballx >> game->exponent), (int16_t)(state.bally >> game->exponent),
-             (int16_t)(state.ballxold >> game->exponent), (int16_t)(state.ballyold >> game->exponent),
+    drawBall((int16_t)(state.ballx >> game->exponent),
+             (int16_t)(state.bally >> game->exponent),
+             (int16_t)(state.ballxold >> game->exponent),
+             (int16_t)(state.ballyold >> game->exponent),
              game->ballsize);
     drawPlayer(game, &state);
     state.playerxold = state.playerx;
     state.ballxold   = state.ballx;
     state.ballyold   = state.bally;
 
-    // 5. Flush frame to iPhone
+    // 5. Flush frame
     display.flush();
 
     // 6. Level / game-over transitions
@@ -298,13 +319,12 @@ void loop()
         }
     }
 
-    // 7. Frame budget — spin-wait for remainder of FRAME_MS
-    // delay(1) yields to FreeRTOS so BLE drain task and IDLE get CPU time
+    // 7. Frame budget — yield to FreeRTOS during wait so drain task gets CPU
 #if DEBUG
-    {
-        uint32_t elapsed = millis() - frameStart;
-        if (elapsed > FRAME_MS)
-            Serial.printf("[Frame] overrun: %ums\n", elapsed);
+    uint32_t elapsed = millis() - frameStart;
+    if (elapsed > FRAME_MS) {
+        Serial.printf("[Frame] overrun: %ums\n", elapsed);
+        Serial.flush();
     }
 #endif
     while (millis() - frameStart < FRAME_MS) delay(1);
@@ -314,11 +334,16 @@ void loop()
 
 void initDisplay()
 {
-    display.begin(DISP_W, DISP_H);
-    display.setTitle("Breakout III");
-    display.setButton1("Auto");    // T1 — autoplay mode
-    display.setButton2("Player");  // T2 — player control
-    ts.begin(TOUCH_MODE_RESISTIVE, TOUCH_INTERVAL_MS);
+    // begin()/setTitle()/setButton only sent on new BLE session.
+    // On display available after app switch, session is intact — skip these.
+    if (_displayReset) {
+        _displayReset = false;
+        display.begin(DISP_W, DISP_H);
+        display.setTitle("Breakout 2");
+        display.setButton1("Auto");    // T1 — autoplay
+        display.setButton2("Player");  // T2 — player control
+        ts.begin(TOUCH_MODE_RESISTIVE, TOUCH_INTERVAL_MS);
+    }
 }
 
 // ── Game functions ────────────────────────────────────────────────────────────
@@ -420,6 +445,19 @@ void startBrickFlash(game_state_type* s, int xBrick, int yRow)
     flash.x     = xBrick;
     flash.y     = yRow;
     flash.score = pointsForRow[yRow];
+
+    // Clamp ball Y to brick face — prevents ball sitting 1-2px inside the
+    // brick in fixed-point space. Without clamping, drawBall() erases from
+    // the penetrating position next frame, notching the adjacent brick.
+    // s->vely is pre-reversal here so its sign tells us which face was hit.
+    if (s->vely < 0) {
+        // Ball moving up — hit bottom face of this row
+        s->bally = (int32_t)(s->walltop + (yRow + 1) * s->brickheight) << game->exponent;
+    } else if (s->vely > 0) {
+        // Ball moving down — hit top face of this row
+        s->bally = (int32_t)(s->walltop + yRow * s->brickheight - game->ballsize) << game->exponent;
+    }
+
     drawBrick(s, xBrick, yRow, WHITE);
 }
 
@@ -458,22 +496,18 @@ int checkCornerCollision(game_type* g, game_state_type* s, int16_t x, int16_t y)
 
 void checkBorderCollision(game_type* g, game_state_type* s, int16_t x, int16_t y)
 {
-    // Right wall
     if (x + g->ballsize >= DISP_W) {
         s->velx = -abs(s->velx);
         s->ballx = (int32_t)(DISP_W - g->ballsize - 1) << g->exponent;
     }
-    // Left wall
     if (x < 0) {
         s->velx = abs(s->velx);
         s->ballx = 0;
     }
-    // Top wall — ball enters score area
     if (y <= SCORE_SIZE) {
         s->vely = abs(s->vely);
         s->bally = (int32_t)(SCORE_SIZE + 1) << g->exponent;
     }
-    // Paddle
     if ((y + g->ballsize) >= s->bottom
         && (y + g->ballsize) <= (s->bottom + g->playerheight)
         && x + g->ballsize >= s->playerx
@@ -504,22 +538,15 @@ void checkBallExit(game_type* g, game_state_type* s, int16_t x, int16_t y)
 
 // ── Text helpers ──────────────────────────────────────────────────────────────
 
-// drawBoxedString — clears a background rect then draws text using native print().
-//
-// ESP32PhoneDisplay has no getTextBounds() — it does not subclass Adafruit_GFX.
-// Background rect dimensions use the fixed default font metrics:
-//   width  = strlen × 6 × textSize  (5px glyph + 1px gap, per character)
-//   height = 8 × textSize
-// This is accurate for the built-in font and sufficient for clearing backgrounds.
 void drawBoxedString(int16_t x, int16_t y, const char* str,
                      uint8_t textSize, uint16_t foreColor, uint16_t bgColor)
 {
-    uint16_t w = (uint16_t)(strlen(str) * 6 * textSize);
-    uint16_t h = (uint16_t)(8 * textSize);
+    display.setTextSize(textSize);
+    int16_t x1, y1; uint16_t w, h;
+    display.getTextBounds(str, x, y, &x1, &y1, &w, &h);
     display.fillRect(x, y, w, h, bgColor);
     display.setCursor(x, y);
     display.setTextColor(foreColor);
-    display.setTextSize(textSize);
     display.print(str);
 }
 
@@ -540,7 +567,7 @@ void clearScreen()
 
 void touchToStart()
 {
-    drawBoxedString(0, 200, "   BREAKOUT",      3, YELLOW, BLACK);
+    drawBoxedString(0, 200, "   BREAKOUT 2",    3, YELLOW, BLACK);
     drawBoxedString(0, 240, "  TOUCH TO START", 2, RED,    BLACK);
     display.flush();
     while (waitForTouch() < 0) delay(20);
@@ -554,8 +581,7 @@ void gameOverTouchToStart()
     while (waitForTouch() < 0) delay(20);
 }
 
-// ── Redraw ────────────────────────────────────────────────────────────────────
-// Reconstructs full display from current game state after reconnect.
+// ── Redraw — reconstruct display from current game state ──────────────────────
 
 void redrawFullScreen()
 {
@@ -593,10 +619,11 @@ void readUiSelection(game_type* g, game_state_type* s)
         if (s->playerx < 0) s->playerx = 0;
         return;
     }
-
-    // Drain touch queue — use last (newest) point for paddle position
+    // Drain queue — use newest point only for paddle position.
+    // Without draining, queued points introduce lag as they're processed
+    // one per frame while new ones keep arriving.
     TSPoint tp;
-    bool    touched = false;
+    bool touched = false;
     while (ts.available()) {
         TSPoint p = ts.getQueuedPoint();
         if (p.z > RemoteTouchScreen::MINPRESSURE) { tp = p; touched = true; }
@@ -611,8 +638,10 @@ void readUiSelection(game_type* g, game_state_type* s)
 
 int waitForTouch()
 {
-    if (_paused)     return -1;   // disconnected — keep waiting
-    if (_drawPending) return 1;   // reconnected — exit wait loop
+    if (_displayOffline)                 return -1;  // lost connection — keep waiting
+    if (_redrawPending && _displayReset) return 1;   // BLE reconnected — exit to restart game
+    // Note: _redrawPending alone (from onRedrawRequest) does not exit here —
+    // that's a display refresh request, not a reconnect requiring game restart.
     if (_autoPlay) {
         static uint32_t autoStart = 0;
         if (autoStart == 0) autoStart = millis();

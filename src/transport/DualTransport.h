@@ -60,23 +60,23 @@ public:
     void begin()
     {
         // ── BLE callbacks ─────────────────────────────────────────────────────
-        _ble.onSubscribed([this](bool ready) {
-            if (ready) {
-                Serial.printf("[Dual] BLE connected — activating\n");
-                _active = &_ble;
-                if (_onConnected) _onConnected();
-            } else {
-                Serial.printf("[Dual] BLE disconnected\n");
-                if (_active == &_ble) {
-                    // Switch to WiFi if it's connected
-                    if (_wifi.canSend()) {
-                        Serial.printf("[Dual] Switching to WiFi\n");
-                        _active = &_wifi;
-                        if (_onConnected) _onConnected();
-                    } else {
-                        _active = nullptr;
-                        if (_onDisconnected) _onDisconnected();
-                    }
+        _ble.onConnected([this]() {
+            Serial.printf("[Dual] BLE connected — activating\n");
+            _active = &_ble;
+            if (_onConnected) _onConnected();
+        });
+
+        _ble.onDisconnected([this]() {
+            Serial.printf("[Dual] BLE disconnected\n");
+            if (_active == &_ble) {
+                // Switch to WiFi if it's connected
+                if (_wifi.canSend()) {
+                    Serial.printf("[Dual] Switching to WiFi\n");
+                    _active = &_wifi;
+                    if (_onConnected) _onConnected();
+                } else {
+                    _active = nullptr;
+                    if (_onDisconnected) _onDisconnected();
                 }
             }
         });
@@ -211,6 +211,15 @@ public:
     // minMs/maxMs in milliseconds. iOS minimum: 15ms.
     // Shorter = more responsive but more power consumption.
     void  setConnectionInterval(uint16_t minMs, uint16_t maxMs)    { _ble.setConnectionInterval(minMs, maxMs); }
+
+    // Set device name used for BLE advertising and WiFi mDNS hostname.
+    // Default: "ESP32-Display" (BLE) / "esp32-display" (mDNS).
+    // Call before begin(). Use a unique name per device for multi-device setups.
+    // Note: SoftAP SSID is set separately via setSoftAP().
+    void  setDeviceName(const char* name) {
+        _ble.setDeviceName(name);
+        _wifi.setDeviceName(name);
+    }
     void  updateConnectionInterval(uint16_t minMs, uint16_t maxMs) { _ble.updateConnectionInterval(minMs, maxMs); }
     float connIntervalMs() const                                    { return _ble.connIntervalMs(); }
     void  onConnInterval(std::function<void(float)> cb)            { _ble.onConnInterval(cb); }

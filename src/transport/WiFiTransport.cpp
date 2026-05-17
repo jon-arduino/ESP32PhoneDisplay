@@ -17,7 +17,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 static constexpr uint32_t TASK_SLEEP_MS  = 10;   // task yield interval
-static constexpr uint32_t AUTO_FLUSH_MS  = 100;  // max time bytes sit in _txBuf
+static constexpr uint32_t AUTO_FLUSH_MS  = 25;   // max time bytes sit in _txBuf (~40fps)
 static constexpr uint32_t WRITE_TIMEOUT  = 2000; // max ms for a single TCP write
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -26,7 +26,8 @@ static constexpr uint32_t WRITE_TIMEOUT  = 2000; // max ms for a single TCP writ
 WiFiTransport::WiFiTransport(const char *ssid, const char *password,
                              const char *mdnsHostname, uint16_t tcpPort)
     : _ssid(ssid), _password(password),
-      _mdnsHostname(mdnsHostname), _tcpPort(tcpPort)
+      _mdnsHostname(mdnsHostname), _tcpPort(tcpPort),
+      _deviceName(mdnsHostname)
 {
     _bc.onPong([this]() {
         _ping.onPongReceived();
@@ -163,6 +164,9 @@ void WiFiTransport::flushLocked()
         start  = millis();
     }
 
+    // Force immediate TCP push — write() queues in AsyncTCP, send() flushes to stack
+    _client->send();
+
     _txBuf.clear();
     _lastSendMs  = 0;
     _lastFlushMs = millis();
@@ -277,14 +281,14 @@ void WiFiTransport::startSoftAP()
 
 void WiFiTransport::startMDNS()
 {
-    if (!MDNS.begin(_mdnsHostname)) {
+    if (!MDNS.begin(_deviceName.c_str())) {
         Serial.println("[WiFi] ERROR: mDNS failed");
         return;
     }
     MDNS.addService("uart", "tcp", _tcpPort);
     MDNS.addServiceTxt("uart", "tcp", "board", "ESP32");
     MDNS.addServiceTxt("uart", "tcp", "version", "1.0");
-    Serial.printf("[WiFi] mDNS: %s.local port %d\n", _mdnsHostname, _tcpPort);
+    Serial.printf("[WiFi] mDNS: %s.local port %d\n", _deviceName.c_str(), _tcpPort);
 }
 
 void WiFiTransport::startTCPServer()

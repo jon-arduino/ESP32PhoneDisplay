@@ -95,6 +95,12 @@ public:
         if (isConnected()) WiFi.setSleep(enable);
     }
 
+    // Set device name used for mDNS hostname. Default: "esp32-display".
+    // Call before begin(). For multi-device setups, use a unique name per
+    // device — e.g. append a device ID so users can tell them apart.
+    // Note: SoftAP SSID is set separately via setSoftAP().
+    void setDeviceName(const char* name) { _deviceName = name; }
+
     // ── Callbacks ─────────────────────────────────────────────────────────────
     void onConnected   (std::function<void()> cb)         { _onConnected    = cb; }
     void onDisconnected(std::function<void()> cb)         { _onDisconnected = cb; }
@@ -112,6 +118,7 @@ private:
     const char *_ssid;
     const char *_password;
     const char *_mdnsHostname;
+    std::string  _deviceName;
     uint16_t    _tcpPort;
 
     const char *_apSsid       = nullptr;

@@ -47,9 +47,8 @@ ESP32PhoneDisplay display(transport);
 static volatile bool _drawPending = false;
 
 void setup() {
-    // onRedrawRequest — sent by app after reconnect or return from background.
-    // Rebuild the full display here so it stays in sync. Never call display
-    // functions directly from a callback — set a flag and act in loop().
+    // onRedrawRequest — sent after reconnect and when app returns from background.
+    // Rebuild full display here. Never call display from a callback — set a flag.
     // See docs/transport.md for full explanation.
     transport.onRedrawRequest([]() { _drawPending = true; });
     transport.onSubscribed([](bool ready) { if (!ready) _drawPending = false; });
@@ -81,8 +80,6 @@ Open the RemoteGraphics app on your iPhone, tap **BLE**, select **ESP32-Display*
 WiFiTransport     transport("your_ssid", "your_password");
 ESP32PhoneDisplay display(transport);
 
-static volatile bool _drawPending = false;
-
 void setup() {
     transport.onRedrawRequest([]() { _drawPending = true; });
     transport.onConnected([]()    { _drawPending = true; });
@@ -93,7 +90,7 @@ void loop() {
     if (_drawPending) {
         _drawPending = false;
         display.begin(240, 320);
-        display.fillScreen(0x001F);   // blue
+        display.fillScreen(0x001F);
         display.flush();
     }
 }
@@ -131,7 +128,7 @@ ESP32PhoneDisplay display(transport);
 
 ```cpp
 void begin(uint16_t w, uint16_t h);   // call once after transport connects
-void fillScreen(Color color = 0x0000); // fill screen, reset cursor
+void fillScreen(Color color = 0x0000); // fill screen — Adafruit_GFX compatible
 void flush();   // send GFX_CMD_FLUSH to phone + force immediate BLE send
 void setRotation(uint8_t r);          // 0–3 (0 = portrait)
 void invertDisplay(bool invert);
@@ -211,14 +208,13 @@ BleTransport transport;
 ```cpp
 void begin();                            // start BLE advertising
 
-// Called when iPhone subscribes (ready=true) or unsubscribes (ready=false)
+// Called at GATT level on BLE connect (true) or disconnect (false).
+// Use disconnect case to pause drawing. Prefer onRedrawRequest for rebuilds.
 void onSubscribed(std::function<void(bool)> cb);
 
-// Called when iPhone app needs the display rebuilt — after BLE reconnect,
-// or when app returns to foreground after being backgrounded.
-// The iPhone's framebuffer persists across disconnect and app-switching;
-// use this callback to redraw the full screen from current state.
-// See docs/transport.md for full explanation.
+// Called after BLE reconnect and when app returns from background.
+// The iPhone's framebuffer persists across disconnect — use this to rebuild
+// the full display whenever its state may be unknown. See docs/transport.md.
 void onRedrawRequest(std::function<void()> cb);
 
 // Called when iPhone presses T1 (key='1') or T2 (key='2') in the app
@@ -555,20 +551,38 @@ void loop() {
 
 ## Examples
 
+### Getting started
 | Example | Transport | Description |
 |---------|-----------|-------------|
-| `BLE_HelloWorld` | BLE | Minimal text display |
-| `BLE_TouchButtons` | BLE | Touch-driven button UI |
-| `BLE_TouchPaint` | BLE | Finger drawing with path API |
-| `BLE_Telemetry` | BLE | Real-time sensor display |
-| `WiFi_HelloWorld` | WiFi | Minimal WiFi display |
-| `DualTransport_TouchPaint` | Dual | TouchPaint with auto transport switching |
-| `BandwidthTest` | Dual | Measures fillRect/s and KB/s throughput |
-| `Breakout` | BLE | Classic Breakout — ported from Adafruit_TFTLCD |
-| `Breakout_II` | BLE | Fixed 30fps Breakout with speed multiplier |
-| `CompatLayer` | BLE | Demonstrates ESP32PhoneDisplay_Compat API |
-| `CustomTransport` | Custom | Shows how to implement GraphicsTransport |
-| `SerialTest` | — | Protocol smoke test via Serial |
+| `BLE_HelloWorld` | BLE | Minimal example — connection handling, session API, callbacks |
+| `BLE_Telemetry` | BLE | Live sensor data — partial redraw pattern for efficiency |
+| `WiFi_HelloWorld` | WiFi | Minimal WiFi display — same pattern as BLE |
+
+### Touch input
+| Example | Transport | Description |
+|---------|-----------|-------------|
+| `BLE_TouchPaint` | BLE | Finger painting — simple connection model |
+| `BLE_TouchPaint2` | BLE | Low-latency painting — touch queue draining + batched flush |
+| `BLE_TouchButtons` | BLE | On-screen buttons — also demonstrates compat vs native performance |
+
+### Games
+| Example | Transport | Description |
+|---------|-----------|-------------|
+| `Breakout` | BLE | Baseline port — minimal changes from original Adafruit_TFTLCD sketch |
+| `Breakout2` | BLE | Optimised — fixed frame rate, flash state machine, full display management |
+
+### Compat layer and Adafruit_GFX pointers
+| Example | Transport | Description |
+|---------|-----------|-------------|
+| `GFX_Pointer` | BLE | Using libraries that require `Adafruit_GFX*` — three approaches explained |
+
+### Advanced
+| Example | Transport | Description |
+|---------|-----------|-------------|
+| `DualTransport_TouchPaint` | Dual | Auto-switching between BLE and WiFi transports |
+| `BandwidthTest` | Dual | Throughput benchmark — fillRect/s and KB/s |
+| `CustomTransport` | Custom | Implementing `GraphicsTransport` for a new transport |
+| `Serial_test` | — | Protocol smoke test via Serial |
 
 ---
 

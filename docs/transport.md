@@ -321,3 +321,117 @@ for the full wire format.
 | Range               | ~10m             | ~50m             |
 | Best for            | Simple displays  | Touch, animation |
 | Away from network   | Always works     | Use SoftAP       |
+
+---
+
+## BLE vs WiFi — choosing a transport
+
+Both transports deliver comparable performance for typical display applications
+once configured correctly (connection interval set, `setNoDelay` active). The
+choice comes down to your deployment context.
+
+### BLE
+
+**Benefits:**
+- No network infrastructure needed — works anywhere, any location
+- Simpler user experience — no credentials, no network joining
+- Lower power consumption
+- Automatic discovery — iPhone sees the device by name in the app
+
+**Limitations:**
+- Fixed connection interval (minimum 15ms, iOS negotiated) — caps throughput
+- Shared 2.4GHz antenna with WiFi on ESP32 — interference when both active
+- Range typically 10–30m line of sight
+
+**Best for:** portable devices, field use, consumer products, any situation
+where you don't control the network environment.
+
+### WiFi
+
+**Benefits:**
+- Higher throughput ceiling — no fixed connection interval
+- Works across a network — device can be anywhere on the LAN
+- More familiar debugging tools (ping, Wireshark, etc.)
+- SoftAP mode — direct iPhone→ESP32 connection without a router
+
+**Limitations:**
+- Requires WiFi credentials or SoftAP setup
+- Higher power consumption
+- Shared 2.4GHz antenna with BLE on ESP32
+- TCP connection management adds complexity
+
+**Best for:** fixed installations, lab/workshop use, high-throughput
+applications, any situation where network infrastructure exists.
+
+### DualTransport
+
+Advertises both simultaneously — iPhone connects via whichever it chooses.
+The active transport is reported via `activeTransportName()`. Auto-switches
+when one disconnects and the other connects.
+
+The 2.4GHz antenna sharing cost is real but manageable for most applications.
+For demanding use cases requiring full performance from both radios
+simultaneously, consider an ESP32 variant with an external antenna or a
+module with dedicated antenna switching hardware.
+
+### Performance in practice
+
+With the library configured correctly, both transports feel comparable for
+touch drawing and game input:
+
+- **BLE** — set `transport.setConnectionInterval(15, 15)` for games and
+  touch apps. Without this, iOS default (30–100ms) severely limits update rate.
+- **WiFi** — `setNoDelay(true)` is set automatically. Auto-flush at 25ms.
+  No equivalent of the connection interval bottleneck.
+
+Neither transport requires manual flush rate tuning for typical use.
+
+---
+
+## Device naming
+
+All transports advertise with a default name of **"ESP32-Display"** (BLE)
+and **"esp32-display"** (WiFi mDNS). Call `setDeviceName()` before `begin()`
+to override:
+
+```cpp
+transport.setDeviceName("PaintStation");
+transport.begin();
+```
+
+This sets the BLE advertising name and WiFi mDNS hostname. The SoftAP SSID
+(if used) is set separately via `setSoftAP()` — pass the same name if you
+want them to match:
+
+```cpp
+transport.setDeviceName("PaintStation");
+transport.setSoftAP("PaintStation", "mypassword");
+transport.begin();
+```
+
+### Multi-device setups
+
+Two devices advertising with identical names cause problems:
+
+- **BLE** — both appear as identical entries in the app's device list. Users
+  cannot tell them apart.
+- **WiFi mDNS** — collision detection renames one unpredictably
+  (e.g., "esp32-display-2").
+- **SoftAP** — two APs with the same SSID appear as one network. iOS connects
+  to the stronger signal — not user-controllable. Effectively broken.
+
+For multi-device deployments, assign unique names. A simple approach is to
+append the last bytes of the MAC address:
+
+```cpp
+uint8_t mac[6];
+esp_read_mac(mac, ESP_MAC_WIFI_STA);
+char name[32];
+snprintf(name, sizeof(name), "ESP32-%02X%02X", mac[4], mac[5]);
+transport.setDeviceName(name);
+transport.setSoftAP(name, "mypassword");
+transport.begin();
+```
+
+This gives each device a stable, unique, human-readable name (e.g.,
+"ESP32-A1B2") derived from hardware — no manual configuration needed.

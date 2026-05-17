@@ -3,19 +3,18 @@
 // Demonstrates an efficient partial-redraw pattern for live data:
 //
 //   drawLabelFrame() — draws the static layout once on connect.
-//     Title bar, row labels ("Temperature:", "Humidity:", etc.) never change
-//     and are not redrawn on each update.
+//     Title bar and row labels never change and are not redrawn each update.
 //
 //   updateValues() — called every second, redraws only the value column.
 //     Each update clears a small fillRect next to each label and reprints
-//     the value. The static label areas are untouched.
+//     the value. Static label areas are untouched.
 //
 // This keeps per-update BLE traffic very low — 4 × (fillRect + setCursor +
 // setTextColor + 2× print) + flush — regardless of display size.
 //
-// Porting from Adafruit_GFX:
-//   All drawing calls are identical. Only setup and connection handling change.
-//   Lines that differ are marked // #Ported: with the original shown.
+// Porting from Adafruit_GFX: all drawing calls are identical. Only setup
+// and connection handling change — see #Ported comments throughout and
+// docs/porting.md for the full porting guide.
 //
 // Replace the four readXxx() stub functions with your actual sensor reads.
 
@@ -45,21 +44,23 @@
 #define VALUE_H     18      // clear rect height for value area (textSize 2 = 16px + 2px margin)
 
 // #Ported: Adafruit_ST7735 display(TFT_CS, TFT_DC, TFT_RST);
-BleTransport      transport;
-ESP32PhoneDisplay display(transport);
+BleTransport      transport;           // set up bluetooth transport
+ESP32PhoneDisplay display(transport);  // create display instance, passing transport reference
 
 // ── Volatile flags — set on NimBLE task (core 0), read on loop task (core 1) ─
-// Never call display functions from a BLE callback — set flags and act in loop().
-static volatile bool _drawPending = false;
-static volatile bool _paused      = false;
+// Never call display functions or Serial from a BLE callback — set a flag
+// and act on it in loop() instead. This avoids concurrency issues and keeps BLE callbacks fast.
+static volatile bool _redrawPending  = false;  // set when the full label frame needs redrawing. Cleared in loop() after handling.
+static volatile bool _displayOffline = false;  // set when display is offline (app backgrounded, phone locked, or disconnect). Cleared on connect.
+static volatile bool _displayReset   = true;   // set when a new BLE connection requires begin() to re-establish the phone session. Cleared in drawLabelFrame().
 
 static uint32_t _lastUpdate = 0;
 
 // ── Simulated sensor reads — replace with your actual sensor code ─────────────
-float readTemperature() { return 22.5f + (float)(millis() % 100) / 100.0f; }
-float readHumidity()    { return 55.0f + (float)(millis() % 200) / 100.0f; }
-float readPressure()    { return 1013.2f + (float)(millis() % 50) / 10.0f; }
-int   readBattery()     { return 85 - (int)(millis() / 60000) % 20; }
+float readTemperature() { return 22.5f + (float)(millis() % 110) / 100.0f; }
+float readHumidity()    { return 55.0f + (float)(millis() % 230) / 100.0f; }
+float readPressure()    { return 1013.2f + (float)(millis() % 55) / 10.0f; }
+int   readBattery()     { return 85 - (int)(millis() / 60000) % 26; }
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 void drawLabelFrame();
@@ -71,22 +72,45 @@ void setup()
 {
     Serial.begin(115200);
 
-    // onRedrawRequest — sent by the iPhone app ~100ms after connect/reconnect.
-    // Primary trigger for rebuilding the screen.
-    // #Ported: no equivalent — local display is always ready.
+    // ── Register transport callbacks ──────────────────────────────────────────
+    // Callbacks are functions that fire automatically when specific events
+    // occur on the BLE connection. They run on the BLE task (core 0), so we
+    // only set flags here — all drawing and Serial output happens safely in
+    // loop() on core 1 based on those flags.
+
+    // onDisplayAvailable — fires when the iPhone display becomes available
+    // or unavailable. This is the primary signal for tracking whether we can draw or not.
+    //   available=true:  iPhone is ready — start or resume drawing.
+    //                    Fires ~100ms after connect and when app returns to foreground.
+    //   available=false: iPhone display is offline — stop drawing.
+    //                    Fires when app is backgrounded, phone is locked,
+    //                    or on a BT disconnect.
+    transport.onDisplayAvailable([](bool available) {
+        if (available) { _displayOffline = false; _redrawPending = true; }
+        else             _displayOffline = true;
+    });
+
+    // onRedrawRequest — fires when the iPhone needs the full display rebuilt.
+    // Happens when the app returns to the foreground — the screen may be
+    // stale from commands missed while backgrounded. Always fires alongside
+    // onDisplayAvailable(true) in that case.
     transport.onRedrawRequest([]() {
-        _paused      = false;
-        _drawPending = true;
+        _redrawPending = true;
     });
 
-    // onSubscribed — fallback for older app versions; handles disconnect too.
-    // #Ported: no equivalent.
-    transport.onSubscribed([](bool ready) {
-        if (ready) { _paused = false; _drawPending = true; }
-        else        { _paused = true; }
+    // onConnected / onDisconnected — fires when the BLE connection is
+    // established or lost at the transport level. onConnected serves as a
+    // fallback draw trigger if onDisplayAvailable doesn't fire first.
+    // onDisconnected ensures _displayOffline is set if the connection drops —
+    // on a BT link loss, the display-unavailable signal won't arrive from the app.
+    transport.onConnected([]() {
+        _displayOffline = false; _redrawPending = true;
+    });
+    transport.onDisconnected([]() {
+        _displayOffline = true;
+        _displayReset   = true;   // session state is lost on disconnect — begin() needed on next draw
     });
 
-    // #Ported: display.initR(INITR_BLACKTAB);
     transport.begin();
     Serial.println("[BLE] Advertising — waiting for iPhone...");
 }
@@ -95,12 +119,14 @@ void setup()
 
 void loop()
 {
-    if (_paused) { delay(100); return; }
+    if (_displayOffline) { delay(100); return; }
 
-    // Draw static layout on connect or reconnect
-    if (_drawPending) {
-        _drawPending = false;
-        _lastUpdate  = 0;       // force immediate value update after layout draw
+    // Draw full label frame on connect or when display needs rebuilding
+    if (_redrawPending) {
+        _redrawPending = false;
+        _lastUpdate    = 0;     // force immediate value update after frame draw
+        Serial.println("[Display] Drawing label frame");
+        Serial.flush();
         drawLabelFrame();
     }
 
@@ -112,19 +138,21 @@ void loop()
     }
 }
 
-// ── Static layout — drawn once on connect ────────────────────────────────────
+// ── Static layout — drawn on connect and when display needs rebuilding ────────
 //
 // All drawing calls below are identical to Adafruit_GFX.
 
 void drawLabelFrame()
 {
-    // begin() establishes the phone session. Re-call on every reconnect.
-    // setTitle re-sent here since phone may have lost session state.
-    // #Ported: display.initR(INITR_BLACKTAB); — local init is one-time only.
-    display.begin(DISP_W, DISP_H);
-    display.setTitle("ESP32 Telemetry");
+    // begin() and setTitle() only needed when the BLE session is new or reset.
+    // On an app switch/return, the session is intact — just redraw the content.
+    if (_displayReset) {
+        _displayReset = false;
+        display.begin(DISP_W, DISP_H);
+        display.setTitle("ESP32 Telemetry");
+    }
 
-    display.clear(BLACK);       // #Ported: display.fillScreen(ST77XX_BLACK);
+    display.fillScreen(BLACK);  // #Ported: display.fillScreen(ST77XX_BLACK); — identical
 
     // Title bar
     display.fillRect(0, 0, DISP_W, 70, DARK_GREY);
@@ -135,7 +163,7 @@ void drawLabelFrame()
     display.setCursor(10, 42);
     display.setTextSize(1);
     display.setTextColor(CYAN);
-    display.print("Live sensor data — 1s update");
+    display.print("Showing \"live\" sensor data"); 
 
     // Static row labels
     display.setTextSize(2);
@@ -146,14 +174,14 @@ void drawLabelFrame()
     display.setCursor(LABEL_X, ROW4_Y);  display.print("Batt:");
 
     display.flush();    // #Ported: no equivalent
-    Serial.println("[Display] Label frame drawn");
+    Serial.println("[Display] Label frame done");
+    Serial.flush();
 }
 
 // ── Live values — redrawn every second ───────────────────────────────────────
 //
 // Only the value column is redrawn. Static labels are untouched.
 // fillRect clears the previous value; print() draws the new one.
-// Each call sends one GFX_CMD_FILL_RECT + one GFX_CMD_WRITE_CHAR per character.
 
 void updateValues()
 {

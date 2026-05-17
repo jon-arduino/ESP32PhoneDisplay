@@ -120,8 +120,11 @@ void BleTransport::TxCharCB::onSubscribe(NimBLECharacteristic*,
         xSemaphoreGive(_owner->_txDone);
     }
 
-    if (_owner->_subscribedCallback)
-        _owner->_subscribedCallback(_owner->_notifySubscribed);
+    if (_owner->_notifySubscribed) {
+        if (_owner->_onConnected) _owner->_onConnected();
+    } else {
+        if (_owner->_onDisconnected) _owner->_onDisconnected();
+    }
 }
 
 // Called by NimBLE stack when notification is queued to the controller.
@@ -165,7 +168,7 @@ void BleTransport::begin()
         configASSERT(_txDone);
     }
 
-    NimBLEDevice::init("ESP32-Display");
+    NimBLEDevice::init(_deviceName);
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
     Serial.printf("[BLE] MAC: %s\n", NimBLEDevice::getAddress().toString().c_str());
@@ -233,7 +236,7 @@ void BleTransport::startAdvertising()
     adv->addServiceUUID(SERVICE_UUID);
 
     NimBLEAdvertisementData scanResp;
-    scanResp.setName("ESP32-Display");
+    scanResp.setName(_deviceName.c_str());
     adv->setScanResponseData(scanResp);
     adv->setMinInterval(48);
     adv->setMaxInterval(160);

@@ -1,38 +1,42 @@
 // BLE_TouchButtons — touch button demo with performance comparison
 //
-// Shows three buttons on the iPhone display. Tap a button to activate it.
-// Toolbar buttons T1 and T2 update the status area when pressed.
+// Shows three colour buttons on the iPhone display. Tap a button to activate
+// it. Toolbar buttons T1 and T2 update the status area when pressed.
 //
-// Demonstrates the performance difference between two drawing approaches
-// by holding two display objects against the same transport simultaneously:
+// Demonstrates a simple connection model suited to apps where the display
+// is self-managing — buttons are always redrawn from current state when
+// touched, so no redraw is needed on reconnect. Drawing simply resumes
+// when the link comes back up.
 //
-//   tft     — ESP32PhoneDisplay_Compat (Adafruit_GFX subclass)
-//               Required for Adafruit_GFX_Button, which needs an Adafruit_GFX*.
-//               Text rendering routes through Adafruit_GFX's pixel-level font
-//               engine. Each character at textSize 2 decomposes into ~35
-//               individual BLE commands. "RED" alone = ~105 commands.
+// Connection handling:
+//   onDisplayAvailable — primary signal. Pauses interaction when display goes
+//     offline. Resumes when back. No redraw triggered.
+//   onConnected/onDisconnected — transport-level fallback.
+//   onRedrawRequest — fires when app returns from background. Triggers a
+//     full button redraw to rebuild any content iOS may have cleared.
 //
-//   display — ESP32PhoneDisplay (native, fast)
-//               fillRoundRect / drawRoundRect each send one compact command.
-//               print() sends one GFX_CMD_WRITE_CHAR per character; the iPhone
-//               renders each glyph. "GREEN" = 5 commands, "BLUE" = 4 commands.
-//               Total for GREEN or BLUE button: ~10 commands vs ~200+ for RED.
+// Also demonstrates the performance difference between compat and native mode:
 //
-// Both objects share the same BleTransport — commands from either object
-// flow into the same BLE stream in call order. tft.begin() is called once;
-// calling display.begin() would send a second GFX_CMD_BEGIN and reset the
-// phone session, so it is intentionally omitted.
+//   tft (ESP32PhoneDisplay_Compat) — Adafruit_GFX subclass, required to pass
+//     an Adafruit_GFX* to Adafruit_GFX_Button. Text rendering decomposes to
+//     pixel-level commands. RED button uses this — visibly slower.
 //
-// Also demonstrates:
-//   - setTitle() / setButton1() / setButton2() — iPhone nav bar and toolbar
-//   - onRedrawRequest() — clean reconnect redraw
-//   - volatile flag pattern for onKey() — safe cross-core signalling
+//   display (ESP32PhoneDisplay) — native, compact commands. fillRoundRect,
+//     drawRoundRect and print() each send a single BLE command. GREEN and
+//     BLUE buttons use this — visibly faster.
+//
+// Both objects share the same BleTransport. tft.begin() establishes the
+// session — display.begin() is intentionally omitted to avoid resetting it.
+// See docs/porting.md for the full compat vs native explanation.
+//
+// Porting from Adafruit_GFX: drawing calls are identical. Only setup and
+// connection handling change — see #Ported comments throughout.
 
-#include <ESP32PhoneDisplay.h>           // ESP32PhoneDisplay — fast native path
-#include <ESP32PhoneDisplay_Compat.h>    // ESP32PhoneDisplay_Compat — Adafruit_GFX subclass
+#include <ESP32PhoneDisplay.h>
+#include <ESP32PhoneDisplay_Compat.h>
 #include <transport/BleTransport.h>
 #include <touch/RemoteTouchScreen.h>
-#include <Adafruit_GFX.h>               // Adafruit_GFX_Button
+#include <Adafruit_GFX.h>
 
 // ── Colours ───────────────────────────────────────────────────────────────────
 #define BLACK   0x0000
@@ -53,7 +57,7 @@
 #define BTN_RED_Y   75
 #define BTN_GREEN_Y 140
 #define BTN_BLUE_Y  205
-#define STATUS_Y    270     // 15px gap below BLUE button (bottom at 255)
+#define STATUS_Y    270
 #define STATUS_H    50
 
 // ── Objects ───────────────────────────────────────────────────────────────────
@@ -62,84 +66,117 @@ ESP32PhoneDisplay_Compat tft(transport, DISP_W, DISP_H);  // compat — for Adaf
 ESP32PhoneDisplay        display(transport);               // native — for fast GREEN/BLUE drawing
 RemoteTouchScreen        ts(transport);
 
-// ── Buttons — used for touch state only (contains/press/justPressed) ──────────
-// initButtonUL() stores geometry and colours but renders nothing.
+// Adafruit_GFX_Button used for touch state only (contains/press/justPressed).
+// initButtonUL() stores geometry but sends no BLE commands.
 // drawButton() is only called on RED — GREEN and BLUE are drawn via display.
 Adafruit_GFX_Button btnRed, btnGreen, btnBlue;
 
-// ── State ─────────────────────────────────────────────────────────────────────
-static volatile bool _drawPending = false;
-
-// Key press flag — set by onKey() on core 0, read and cleared in loop() on core 1.
-// onKey() runs inside the NimBLE host task. Serial.println() and any function
-// that calls tft.print() or display.print() (which write to the BLE stream
-// buffer) are unsafe from that context. Use a volatile flag and act in loop().
-static volatile int _keyMsg = 0;   // 0=none  1=T1  2=T2
+// ── Volatile flags — set on NimBLE task (core 0), read on loop task (core 1) ─
+// Never call display functions or Serial from a BLE callback — set a flag
+// and act on it in loop() instead. This avoids concurrency issues and keeps BLE callbacks fast.
+static volatile bool    _displayOffline = false;  // set when display is offline. Cleared on connect.
+static volatile bool    _redrawPending  = false;  // set when buttons need redrawing (app foreground return).
+static volatile uint8_t _keyPending     = 0;      // toolbar key press — '1'=T1  '2'=T2  0=none
+static volatile bool    _displayReset   = true;   // set when new connection may have lost session state and display should be reset with begin(). Cleared in loop() after handling.
 
 // ── Forward declarations ──────────────────────────────────────────────────────
-void initDisplay();
+void initSession();
 void drawRedButton(bool active);
 void drawGreenButton(bool active);
 void drawBlueButton(bool active);
 void drawButtons(bool redActive, bool greenActive, bool blueActive);
 void updateStatus(const char *msg, uint16_t color);
 
-// ── Setup ─────────────────────────────────────────────────────────────────────
+// ── setup() ──────────────────────────────────────────────────────────────────
 
 void setup()
 {
     Serial.begin(115200);
 
-    transport.onSubscribed([](bool ready) {
-        if (ready) _drawPending = true;
+    // ── Register transport callbacks ──────────────────────────────────────────
+    // Callbacks fire automatically on the BLE task (core 0). Only set flags
+    // here — drawing and Serial happen safely in loop() on core 1.
+
+    // onDisplayAvailable — primary signal for display ready/offline.
+    //   available=true:  resume drawing — fires ~100ms after connect and
+    //                    when app returns to foreground.
+    //   available=false: pause drawing — app backgrounded, phone locked,
+    //                    or BT disconnect.
+    transport.onDisplayAvailable([](bool available) {
+        _displayOffline = !available;
     });
 
+    // onRedrawRequest — fires when app returns to foreground after backgrounding.
+    // iOS may have cleared the framebuffer so buttons are redrawn from current state.
     transport.onRedrawRequest([]() {
-        _drawPending = true;
+        _redrawPending = true;
     });
 
-    // Set flag only — do not call Serial or tft/display from here.
-    // See volatile flag comment above.
+    // onConnected/onDisconnected — transport-level fallback for
+    // display available/offline if onDisplayAvailable doesn't fire.
+    transport.onConnected([]() {
+        _displayOffline = false;
+    });
+    transport.onDisconnected([]() {
+        _displayOffline = true;
+        _displayReset   = true;   // session state is lost on disconnect — set flag to reset with begin() on next connect
+    });
+
+    // onKey — fires when toolbar button pressed in iPhone app.
+    // T1 sends '1', T2 sends '2'.
     transport.onKey([](uint8_t key) {
-        if      (key == '1') _keyMsg = 1;
-        else if (key == '2') _keyMsg = 2;
+        _keyPending = key;
     });
 
     transport.begin();
-    Serial.println("[BLE] Waiting for iPhone...");
+    Serial.println("[BLE] Advertising — waiting for iPhone...");
 
-    while (!_drawPending) delay(100);
-    _drawPending = false;
-
-    initDisplay();
+    // Wait for first connection before initialising display and touch.
+    while (_displayOffline || !transport.canSend()) delay(100);
+    initSession();
 }
 
-// ── Loop ──────────────────────────────────────────────────────────────────────
+// ── loop() ───────────────────────────────────────────────────────────────────
 
 void loop()
 {
-    // Reconnect redraw — rebuild full screen from scratch
-    if (_drawPending) {
-        _drawPending = false;
-        initDisplay();
+    // Pause while display is offline — no point sending commands.
+    if (_displayOffline) { delay(100); return; }
+
+    if (_displayReset) { // Bt disconnect or new connection may have lost session state — reset display.
+        _displayReset = false;
+        Serial.println("[Display] Resetting display with initSession()");
+        Serial.flush();
+        initSession();
+        return;
+    }   
+
+    // Redraw buttons from current state when app returns from background.
+    if (_redrawPending) {
+        _redrawPending = false;
+        Serial.println("[Display] Redrawing buttons");
+        Serial.flush();
+        drawButtons(false, false, false);
+        updateStatus("Tap a button", GREY);
         return;
     }
 
-    // Toolbar key press — handled here on core 1 where Serial and display are safe
-    if (_keyMsg != 0) {
-        int key = _keyMsg;
-        _keyMsg  = 0;
-        if (key == 1) {
+    // Toolbar key press
+    if (_keyPending) {
+        uint8_t key = _keyPending;
+        _keyPending  = 0;
+        if (key == '1') {
             updateStatus("Toolbar: T1", WHITE);
             Serial.println("[Key] T1");
         } else {
             updateStatus("Toolbar: T2", WHITE);
             Serial.println("[Key] T2");
         }
+        Serial.flush();
         return;
     }
 
-    // Touch — read current position and update button state
+    // Touch — read position and update button state
     TSPoint p        = ts.getPoint();
     bool    touching = (p.z > RemoteTouchScreen::MINPRESSURE);
 
@@ -151,26 +188,30 @@ void loop()
         drawButtons(true, false, false);
         updateStatus("RED selected", RED);
         Serial.println("[Touch] RED");
+        Serial.flush();
     }
     if (btnGreen.justPressed()) {
         drawButtons(false, true, false);
         updateStatus("GREEN selected", GREEN);
         Serial.println("[Touch] GREEN");
+        Serial.flush();
     }
     if (btnBlue.justPressed()) {
         drawButtons(false, false, true);
         updateStatus("BLUE selected", BLUE);
         Serial.println("[Touch] BLUE");
+        Serial.flush();
     }
 }
 
-// ── Display init ──────────────────────────────────────────────────────────────
+// ── Session init — called once on first connect ───────────────────────────────
 
-void initDisplay()
+void initSession()
 {
-    // tft.begin() sends GFX_CMD_BEGIN — establishes the phone display session.
-    // display.begin() is intentionally not called; a second BEGIN would reset
-    // the session and clear the screen mid-draw.
+    // tft.begin() establishes the phone session for both tft and display —
+    // they share the same transport. display.begin() intentionally omitted;
+    // a second GFX_CMD_BEGIN would reset the session.
+    // On reconnect, session state is intact — begin() not needed.
     tft.begin();
     tft.setTitle("Touch Buttons");
     tft.setButton1("T1");
@@ -178,14 +219,13 @@ void initDisplay()
 
     tft.fillScreen(BLACK);
 
-    // Title — use display.print() for single-command-per-character rendering
+    // Title text via display.print() for single-command-per-character rendering
     display.setCursor(20, 20);
     display.setTextColor(WHITE);
     display.setTextSize(2);
     display.print("Touch Buttons");
 
-    // Register button geometry for touch hit-testing.
-    // initButtonUL() stores x/y/w/h/colours but sends no BLE commands.
+    // Register button geometry for touch hit-testing — no BLE commands sent
     btnRed.initButtonUL  (&tft, BTN_X, BTN_RED_Y,   BTN_W, BTN_H, WHITE, RED,     WHITE, (char*)"RED",   2);
     btnGreen.initButtonUL(&tft, BTN_X, BTN_GREEN_Y,  BTN_W, BTN_H, WHITE, DKGREEN, WHITE, (char*)"GREEN", 2);
     btnBlue.initButtonUL (&tft, BTN_X, BTN_BLUE_Y,   BTN_W, BTN_H, WHITE, BLUE,   WHITE, (char*)"BLUE",  2);
@@ -196,29 +236,22 @@ void initDisplay()
     ts.begin();
 
     Serial.println("[Display] Ready");
+    Serial.flush();
 }
 
 // ── Button drawing ────────────────────────────────────────────────────────────
 
 // RED — slow path via Adafruit_GFX_Button::drawButton().
-// Text rendering decomposes each glyph into ~35 pixel-level BLE commands via
-// Adafruit_GFX's built-in font engine. Visibly slower than GREEN/BLUE.
+// Text rendering decomposes each glyph into ~35 pixel-level BLE commands.
 void drawRedButton(bool active)
 {
     btnRed.drawButton(active);
 }
 
 // GREEN — fast path via ESP32PhoneDisplay (display).
-// fillRoundRect → 1 command  (GFX_CMD_FILL_ROUNDRECT)
-// drawRoundRect → 1 command  (GFX_CMD_DRAW_ROUNDRECT)
-// setTextSize   → 1 command
-// setCursor     → 1 command
-// setTextColor  → 1 command
-// print()       → 1 GFX_CMD_WRITE_CHAR per character; iPhone renders the glyph
-// Total: ~10 commands vs ~200+ for the RED button.
-//
-// getTextBounds() is called on tft (Adafruit_GFX) for text centering — it is
-// pure local math and sends no BLE commands. ESP32PhoneDisplay has no equivalent.
+// fillRoundRect(1) + drawRoundRect(1) + setTextSize(1) + setCursor(1) +
+// setTextColor(1) + print chars(5) = ~10 commands vs ~200+ for RED.
+// getTextBounds() on tft is pure local math — sends no BLE commands.
 void drawGreenButton(bool active)
 {
     uint16_t fill = active ? WHITE   : DKGREEN;
@@ -227,11 +260,9 @@ void drawGreenButton(bool active)
     display.fillRoundRect(BTN_X, BTN_GREEN_Y, BTN_W, BTN_H, BTN_RADIUS, fill);
     display.drawRoundRect(BTN_X, BTN_GREEN_Y, BTN_W, BTN_H, BTN_RADIUS, WHITE);
 
-    // getTextBounds on tft — local Adafruit_GFX math, zero BLE commands
     int16_t tx, ty; uint16_t tw, th;
     tft.setTextSize(2);
     tft.getTextBounds("GREEN", 0, 0, &tx, &ty, &tw, &th);
-
     display.setTextSize(2);
     display.setCursor(BTN_X + (BTN_W - tw) / 2, BTN_GREEN_Y + (BTN_H - th) / 2);
     display.setTextColor(text);
@@ -250,37 +281,14 @@ void drawBlueButton(bool active)
     int16_t tx, ty; uint16_t tw, th;
     tft.setTextSize(2);
     tft.getTextBounds("BLUE", 0, 0, &tx, &ty, &tw, &th);
-
     display.setTextSize(2);
     display.setCursor(BTN_X + (BTN_W - tw) / 2, BTN_BLUE_Y + (BTN_H - th) / 2);
     display.setTextColor(text);
     display.print("BLUE");
 }
 
-// Draw all three buttons then flush once — all commands accumulate in the BLE
-// stream buffer and drain together in a single batch.
-//
-// BLE packet capacity: 252 bytes per notification (MTU 255 - 3 ATT header).
-// Each GFX command has 4 bytes of framing overhead + payload.
-//
-// RED via Adafruit_GFX_Button::drawButton() — compat mode:
-//   fillRoundRect and drawRoundRect decompose to ~130 drawFastHLine/drawPixel
-//   commands. Text "RED" at textSize 2 adds ~60 commands. Total ~8-10 packets.
-//
-// GREEN + BLUE via ESP32PhoneDisplay — native mode:
-//   fillRoundRect(1) + drawRoundRect(1) + setTextSize(1) + setCursor(1) +
-//   setTextColor(1) + print chars(4-5) = ~10 commands per button, ~80 bytes.
-//   Both buttons together fit comfortably within one packet.
-//
-// Full drawButtons() total: ~9-11 packets. At a 15ms BLE connection interval
-// this drains in 1-2 intervals (~15-30ms) — imperceptible.
-//
-// Original all-compat version (three drawButton() calls): ~25-30 packets,
-// draining over 3-4 intervals (~375-450ms). Visibly slow.
-//
-// Takeaway: when total frame commands fit in 1-2 packets, compat mode overhead
-// is negligible — it gets carried along in the batch. As compat command count
-// grows, each additional packet adds one full connection interval to frame time.
+// All three buttons flush together in a single batch.
+// See docs/porting.md for the full compat vs native packet analysis.
 void drawButtons(bool redActive, bool greenActive, bool blueActive)
 {
     drawRedButton(redActive);

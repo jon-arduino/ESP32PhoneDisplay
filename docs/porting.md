@@ -54,8 +54,22 @@ identical.
 ### Colour constants
 
 Adafruit defines colour constants in their display headers (`ST77XX_BLACK`,
-`ILI9341_RED`, etc.). These aren't available when you remove the TFT include.
-Replace them with RGB565 hex values or define your own:
+`ILI9341_RED`, etc.). These aren't available once you remove the TFT include.
+
+The simplest fix — include `Colors.h` from this library:
+
+```cpp
+#include <Colors.h>
+```
+
+This defines the full set of standard RGB565 colours plus drop-in aliases
+for all common Adafruit driver constants (`ST77XX_*`, `ILI9341_*`, `HX8357_*`,
+`SSD1351_*`). Sketches using those constants need no further changes.
+
+Each constant is `#ifndef` guarded so `Colors.h` can coexist with an existing
+display driver header without redefinition errors.
+
+Alternatively, define your own RGB565 values:
 
 ```cpp
 #define BLACK   0x0000
@@ -66,7 +80,7 @@ Replace them with RGB565 hex values or define your own:
 #define CYAN    0x07FF
 #define MAGENTA 0xF81F
 #define YELLOW  0xFFE0
-#define ORANGE  0xFC00
+#define ORANGE  0xFD20
 ```
 
 ### Sketches that use Adafruit_GFX* pointers
@@ -112,7 +126,7 @@ void setup() {
     transport.begin();
     while (!transport.canSend()) { delay(100); }
     display.begin(240, 320);
-    display.clear(0x0000);
+    display.fillScreen(0x0000);
     display.setCursor(0, 0);
     display.setTextColor(0xFFFF);
     display.print("Hello!");
@@ -210,10 +224,21 @@ more screen real estate on a modern iPhone.
 
 ### flush()
 
-`flush()` marks an explicit frame boundary. The iPhone auto-flushes when the
-command stream goes idle, so `flush()` is not strictly required — but calling
-it at the end of each logical frame is best practice. It makes rendering
-deterministic and prevents partial frames from appearing during complex draws.
+`flush()` marks an explicit frame boundary and sends a sync marker to the
+iPhone. Internally it also wakes the BLE drain task immediately rather than
+waiting for the 5ms idle timeout.
+
+Every `flush()` call results in a BLE packet being sent. How quickly that
+packet reaches the iPhone depends on the **BLE connection interval** — the
+rate at which the ESP32 and iPhone exchange data. At the iOS default interval
+(30–100ms), each flush can take up to 100ms to deliver. At 15ms, delivery
+is within 15ms. For games and animations this difference is dramatic —
+see the Performance section below.
+
+`flush()` is not strictly required — commands auto-flush within 5ms of going
+idle — but calling it at the end of each logical frame is best practice. It
+makes rendering deterministic and prevents partial frames appearing during
+complex draws.
 
 ---
 
@@ -339,7 +364,93 @@ ts.begin(TOUCH_MODE_SINGLE, 100);  // 100ms = 10Hz
 
 ---
 
-## Common issues
+## Performance
+
+### Connection interval — first-order fix for games and animations
+
+**This is the single most impactful change for any ported game or animation.**
+
+BLE data exchange happens in connection intervals — time slots negotiated
+between the ESP32 and iPhone. The iOS default is typically 30–100ms. Every
+`flush()` call sends a BLE packet, but that packet cannot leave until the
+next connection interval. At 100ms intervals, a game running at 60fps still
+only updates the display 10 times per second — regardless of how fast the
+ESP32 is drawing.
+
+Set the connection interval before calling `transport.begin()`:
+
+```cpp
+// Request 15ms interval — essential for games and animations.
+// iOS minimum is 15ms. Must be called before transport.begin().
+transport.setConnectionInterval(15, 15);
+
+transport.begin();
+```
+
+**Effect:** At 15ms intervals, each `flush()` delivers within 15ms —
+effectively 60+ fps potential. At the iOS default, the same code may deliver
+at 10–30fps regardless of game loop speed. This single change transformed the
+Breakout example from barely playable to smooth.
+
+**Rule of thumb:** Set connection interval to 15ms for any sketch that calls
+`flush()` more than once per second. For static displays or slow telemetry
+updates, the default is fine.
+
+### flush() and connection interval
+
+Every `flush()` is a BLE packet, and the connection interval controls how
+quickly packets are delivered:
+
+| Connection interval | Max flush rate | Suitable for                    |
+|---------------------|----------------|---------------------------------|
+| 15ms (set manually) | ~67/sec        | Games, animation, touch drawing |
+| 30ms (iOS default)  | ~33/sec        | UI, moderate update rates       |
+| 100ms (iOS default) | ~10/sec        | Telemetry, slow updates         |
+
+Don't flush more often than the connection interval allows — excess flushes
+queue up in the stream buffer and add latency rather than reducing it.
+
+### Touch queue draining for drawing apps
+
+`RemoteTouchScreen` maintains a 16-point FIFO queue of touch events. Two
+usage patterns suit different app types:
+
+**Games — current position only (`ts.getPoint()`):**
+Returns the newest touch position and discards queued history. Equivalent
+to a live ADC read on physical hardware. Use for paddle control, button
+presses, any case where only the current finger position matters.
+
+```cpp
+TSPoint p = ts.getPoint();
+if (p.z > RemoteTouchScreen::MINPRESSURE) {
+    paddle_x = p.x;
+}
+```
+
+**Drawing apps — full path (`ts.available()` + `ts.getQueuedPoint()`):**
+Drains all queued points since the last loop pass and draws each one.
+Combined with a single `flush()` after the drain, this batches all stroke
+commands into one or two BLE packets — the key to low-latency drawing.
+Without queue draining, strokes lag visibly as the queue fills faster than
+loop() processes it.
+
+```cpp
+bool drew = false;
+while (ts.available()) {
+    TSPoint p = ts.getQueuedPoint();
+    if (p.z > RemoteTouchScreen::MINPRESSURE) {
+        display.fillCircle(p.x, p.y, radius, color);
+        drew = true;
+    }
+}
+if (drew) display.flush();   // one packet for all points in this pass
+```
+
+See `BLE_TouchPaint2` for a complete working example and explanation of
+why queue draining and batched flush are inseparable for low-latency drawing.
+
+---
+
 
 **Display is blank after porting:**
 Make sure you call `transport.begin()` and wait for `isConnected()` before

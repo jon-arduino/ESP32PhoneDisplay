@@ -1,15 +1,18 @@
 // BLE_HelloWorld — minimal ESP32PhoneDisplay example
 //
-// A simple useful BLE display sketch. Draws a screen on the iPhone,
-// handles reconnect cleanly, and responds to toolbar button presses.
+// A simple BLE display sketch. Draws a screen on the iPhone and handles
+// reconnect cleanly. This is a good starting point for new sketches.
 //
-// This is a good starting point for new sketches. For a detailed
-// walkthrough of all connection callbacks and protocol diagnostics,
-// see BLE_protocol_diagnostics.
+// The device advertises as "Hello_ESP32" — set via setDeviceName() below.
+// Change to a unique name for multi-device deployments.
+// See docs/transport.md for device naming guidance.
+//
+// For a detailed walkthrough of callbacks and protocol diagnostics,
+// see BLE_HelloWorld_Debug.
 //
 // Porting from Adafruit_GFX: all drawing calls are identical. Only setup
-// and connection handling change — see "#Ported;" comments throughout to see exactly 
-// what changed and why. For complete porting instructions, see docs/porting.md.
+// and connection handling change — see #Ported comments throughout and
+// docs/porting.md for the full porting guide.
 
 // #Ported: #include <Adafruit_ST7735.h>
 #include <ESP32PhoneDisplay.h>
@@ -29,19 +32,18 @@
 #define DISP_H  320
 
 // #Ported: Adafruit_ST7735 display(TFT_CS, TFT_DC, TFT_RST);
-BleTransport      transport;    //setup bluetooth transport
-ESP32PhoneDisplay display(transport);  //create display instance, passing transport reference
+BleTransport      transport;           // set up bluetooth transport
+ESP32PhoneDisplay display(transport);  // create display instance, passing transport reference
 
 // ── Volatile flags — set on NimBLE task (core 0), read on loop task (core 1) ─
 // Never call display functions or Serial from a BLE callback — set a flag
-// and act on it in loop() instead.  This avoids concurrency issues and keeps BLE callbacks fast.
-static volatile bool    _redrawPending = false;   // Set when we need to redraw the screen due to a connect, reconnect, or redraw request event. Cleared in loop() after handling.
-static volatile bool    _displayOffline      = false; // Set when the display is offline (app backgrounded, phone locked, or clean disconnect). Cleared on connect.
-static volatile uint8_t _keyPending  = 0;   // tracks button pushes'1'=T1  '2'=T2  0=none
+// and act on it in loop() instead. This avoids concurrency issues and keeps BLE callbacks fast.
+static volatile bool _redrawPending  = false;  // set when screen needs redrawing. Cleared in loop() after handling.
+static volatile bool _displayOffline = false;  // set when display is offline. Cleared on connect.
+static volatile bool _displayReset   = true;   // set when session state is lost — begin() needed on next draw.
 
 // ── Forward declarations ──────────────────────────────────────────────────────
 void drawScreen();
-void drawKeyBanner(uint8_t key);
 
 // ── setup() ──────────────────────────────────────────────────────────────────
 
@@ -49,43 +51,42 @@ void setup()
 {
     Serial.begin(115200);
 
+    // Custom device name — appears in the iPhone app's BLE device list.
+    // Change to a unique name for multi-device deployments.
+    transport.setDeviceName("Hello_ESP32");
+
+    // ── Register transport callbacks ──────────────────────────────────────────
+    // Callbacks fire automatically on the BLE task (core 0). Only set flags
+    // here — all drawing and Serial output happens safely in loop() on core 1.
+
     // onDisplayAvailable — primary signal for display ready/offline.
-    // available=true:  display ready — sent ~100ms after connect/reconnect
-    //                  and when app returns to foreground.
-    // available=false: display offline — app backgrounded, phone locked,
-    //                  or clean disconnect. Pause drawing here.
-    // #Ported: no equivalent — local displays are always ready.
+    //   available=true:  iPhone is ready — start or resume drawing.
+    //                    Fires ~100ms after connect and when app returns to foreground.
+    //   available=false: iPhone display is offline — stop drawing.
+    //                    Fires when app is backgrounded, phone is locked, or on BT disconnect.
     transport.onDisplayAvailable([](bool available) {
         if (available) { _displayOffline = false; _redrawPending = true; }
         else             _displayOffline = true;
     });
 
-    // onRedrawRequest — display state may be stale, rebuild current display.
-    // Fired when app returns from background (in addition to onDisplayAvailable).
-    // Not fired on fresh connect — onDisplayAvailable covers that.
-    // #Ported: no equivalent.
-    transport.onRedrawRequest([]() {
-        _redrawPending = true;
-    });
+    // onRedrawRequest — fires when the iPhone needs the full display rebuilt.
+    // Happens when the app returns to foreground — screen may be stale.
+    transport.onRedrawRequest([]() { _redrawPending = true; });
 
-    // onSubscribed — fallback for older app versions that don't send
-    // BC_CMD_DISPLAY_AVAILABLE. A double-draw if both fire is harmless.
-    // Also catches the disconnect case (ready=false).
-    // #Ported: no equivalent.
-    transport.onSubscribed([](bool ready) {
-        if (ready) { _displayOffline = false; _redrawPending = true; }
-        else         _displayOffline = true;
+    // onConnected / onDisconnected — BLE connection established or lost.
+    // onConnected serves as fallback draw trigger if onDisplayAvailable doesn't fire.
+    // onDisconnected sets _displayReset so begin() is re-sent on next connection.
+    transport.onConnected([]() {
+        _displayOffline = false; _redrawPending = true;
     });
-
-    // onKey — T1 ('1') or T2 ('2') toolbar button pressed.
-    // #Ported: no equivalent — local displays have no back-channel.
-    transport.onKey([](uint8_t key) {
-        _keyPending = key;
+    transport.onDisconnected([]() {
+        _displayOffline = true;
+        _displayReset   = true;   // session lost — begin() needed on next draw
     });
 
     // #Ported: display.initR(INITR_BLACKTAB); display.setRotation(0);
     transport.begin();
-    Serial.println("[BLE] Advertising — waiting for iPhone...");
+    Serial.println("[BLE] Advertising as 'Hello_ESP32' — waiting for iPhone...");
 }
 
 // ── loop() ───────────────────────────────────────────────────────────────────
@@ -93,15 +94,6 @@ void setup()
 void loop()
 {
     if (_displayOffline) { delay(100); return; }
-
-    if (_keyPending) {
-        uint8_t key = _keyPending;
-        _keyPending  = 0;
-        Serial.printf("[Key] T%c pressed\n", key);
-        Serial.flush();
-        drawKeyBanner(key);
-        return;
-    }
 
     if (_redrawPending) {
         _redrawPending = false;
@@ -117,12 +109,11 @@ void loop()
 
 void drawScreen()
 {
-    // begin() establishes the phone session — re-call on every connect.
-    // setTitle/setButton re-sent here since phone may have lost session state.
-    // #Ported: display.initR(INITR_BLACKTAB); — local init is one-time only.
-    display.begin(DISP_W, DISP_H);
-    display.setTitle("Hello World");
-    display.setButton1("T1");
+    if (_displayReset) {
+        _displayReset = false;
+        display.begin(DISP_W, DISP_H);
+        display.setTitle("Hello World");
+    }
 
     // All drawing calls below are identical to Adafruit_GFX — no changes needed.
     display.fillScreen(BLACK);      // #Ported: display.fillScreen(ST77XX_BLACK); — identical
@@ -143,7 +134,7 @@ void drawScreen()
     display.setCursor(35, 103);
     display.print("BLE transport active");
     display.setCursor(35, 118);
-    display.print("Press T1 for a banner");
+    display.print("BLE name: Hello_ESP32");
 
     // Shapes — identical to any Adafruit_GFX sketch
     display.fillCircle( 70, 230, 35, RED);
@@ -153,7 +144,7 @@ void drawScreen()
     display.setCursor(20, 295);
     display.setTextColor(LIGHT_GREY);
     display.setTextSize(1);
-    display.print("Switch apps or power off/on to test display redraw"); 
+    display.print("Switch apps or disconnect to test redraw");
 
     // flush() sends a sync marker and wakes the BLE drain task.
     // Auto-flush also delivers commands, but explicit flush ensures
@@ -163,16 +154,4 @@ void drawScreen()
 
     Serial.println("[Display] Done");
     Serial.flush();
-}
-
-void drawKeyBanner(uint8_t key)
-{
-    display.fillRect(0, 275, DISP_W, 45, (key == '1') ? RED : BLUE);
-    display.setCursor(55, 288);
-    display.setTextColor(WHITE);
-    display.setTextSize(2);
-    display.print("T");
-    display.print((char)key);
-    display.print(" pressed");
-    display.flush();    // #Ported: no equivalent
 }

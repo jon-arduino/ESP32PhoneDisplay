@@ -17,6 +17,10 @@
 #include <transport/BleTransport.h>
 #include <touch/RemoteTouchScreen.h>
 
+#define TOUCH_INTERVAL_MS    30    // iPhone MOVE event throttle (ms)
+#define BLE_INTERVAL_MIN_MS  15    // BLE connection interval min (ms)
+#define BLE_INTERVAL_MAX_MS  30    // BLE connection interval max (ms)
+
 // ── Colour palette (RGB565) ───────────────────────────────────────────────────
 #define BLACK   0x0000
 #define WHITE   0xFFFF
@@ -48,7 +52,7 @@ uint16_t currentColor = RED;
 // ── Draw the UI chrome ────────────────────────────────────────────────────────
 void drawUI()
 {
-    display.clear(BLACK);
+    display.fillScreen(BLACK);
 
     // Colour swatches
     display.fillRect(0,           0, BOXSIZE, BOXSIZE, RED);
@@ -75,6 +79,8 @@ void drawUI()
 void setup()
 {
     Serial.begin(115200);
+        transport.setConnectionInterval(BLE_INTERVAL_MIN_MS, BLE_INTERVAL_MAX_MS);
+        
     transport.begin();
 
     Serial.println("Waiting for iPhone...");
@@ -84,7 +90,9 @@ void setup()
     drawUI();
 
     // Start touch with 16ms move throttle for smooth drawing
-    ts.begin(TOUCH_MODE_RESISTIVE, 16);
+    ts.begin(TOUCH_MODE_RESISTIVE, TOUCH_INTERVAL_MS);
+
+    //ts.begin(TOUCH_MODE_RESISTIVE, 16);
 
     Serial.println("Ready — draw on the iPhone screen!");
 }
@@ -135,5 +143,5 @@ void loop()
 
     // ── Drawing area ──────────────────────────────────────────────────────────
     display.fillCircle(p.x, p.y, PENRADIUS, currentColor);
-    display.flush();
+    // display.flush();
 }

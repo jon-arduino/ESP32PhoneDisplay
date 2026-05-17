@@ -28,6 +28,11 @@ public:
     // minMs/maxMs in milliseconds. BLE step size is 1.25ms.
     // iOS minimum: 15ms. Shorter = more responsive but more power.
     // Default: iOS-negotiated (~25ms).
+    // Set device name used for BLE advertising. Default: "ESP32-Display".
+    // Call before begin(). For multi-device setups, use a unique name per
+    // device — e.g. append a device ID so users can tell them apart.
+    void setDeviceName(const char* name) { _deviceName = name; }
+
     void setConnectionInterval(uint16_t minMs, uint16_t maxMs)
     {
         _connIntervalMin = (uint16_t)(minMs / 1.25f);
@@ -72,7 +77,8 @@ public:
     void onRedrawRequest(std::function<void()> cb)                   { _bc.onRedrawRequest(cb); }
     void onDisplayAvailable(std::function<void(bool)> cb)             { _bc.onDisplayAvailable(cb); }
     void onTouch(std::function<void(uint8_t, int16_t, int16_t, uint8_t)> cb) override { _bc.onTouch(cb); }
-    void onSubscribed(std::function<void(bool)> cb) { _subscribedCallback = cb; }
+    void onConnected   (std::function<void()> cb) { _onConnected    = cb; }
+    void onDisconnected(std::function<void()> cb) { _onDisconnected = cb; }
 
     // Back-channel parser diagnostics
     BackChannelParser::Stats bcStats() const { return _bc.getStats(); }
@@ -85,6 +91,7 @@ private:
     friend class RxCharCB;
     friend void connUpdateTask(void*);
 
+    std::string           _deviceName = "ESP32-Display";
     NimBLEServer         *pServer  = nullptr;
     NimBLECharacteristic *pTxChar  = nullptr;
     NimBLECharacteristic *pRxChar  = nullptr;
@@ -119,7 +126,8 @@ private:
     // How long sendBytes() blocks when TX stream buffer is full.
 
     BackChannelParser _bc;
-    std::function<void(bool)> _subscribedCallback;
+    std::function<void()> _onConnected;
+    std::function<void()> _onDisconnected;
 
     // ── Drain task ────────────────────────────────────────────────────────────
     static void drainTaskFunc(void *arg);
