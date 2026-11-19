@@ -114,6 +114,18 @@ public:
     void drawBitmap(int16_t x, int16_t y,
                     const uint8_t *bitmap, int16_t w, int16_t h,
                     Color fg, Color bg);
+    // 1-bit X11 bitmap (LSB first), like Adafruit_GFX::drawXBitmap()
+    void drawXBitmap(int16_t x, int16_t y,
+                     const uint8_t *bitmap, int16_t w, int16_t h, Color color);
+    // RGB565 colour image, like Adafruit_GFX::drawRGBBitmap(); optional 1-bit mask (1 = draw).
+    void drawRGBBitmap(int16_t x, int16_t y,
+                       const uint16_t *bitmap, int16_t w, int16_t h);
+    void drawRGBBitmap(int16_t x, int16_t y,
+                       const uint16_t *bitmap, const uint8_t *mask, int16_t w, int16_t h);
+    // 8-bit gray image. Shown as a true gray ramp (unlike Adafruit_GFX::drawGrayscaleBitmap,
+    // which uses the 8-bit value itself as the colour).
+    void drawGrayscaleBitmap(int16_t x, int16_t y,
+                             const uint8_t *bitmap, int16_t w, int16_t h);
 
     // ── Text ──────────────────────────────────────────────────────────────────
     // Compatible with Adafruit_GFX text API. print()/println() work via write().
@@ -157,6 +169,11 @@ private:
     void sendCommandWithTail(uint8_t cmd,
                              const void *fixed,  uint16_t fixedLen,
                              const void *tail,   uint16_t tailLen);
+    // Like sendCommandWithTail but with two tails (used by the masked RGB bitmap).
+    void sendCommandWithTails(uint8_t cmd,
+                              const void *fixed, uint16_t fixedLen,
+                              const void *t1,    uint16_t l1,
+                              const void *t2,    uint16_t l2);
 
     // getTextBounds helper — advances (x,y) and expands bounding box per character.
     // Mirrors Adafruit_GFX::charBounds() using our local state instead of inheritance.

@@ -54,6 +54,10 @@ enum GfxCommand : uint8_t
     // Bitmaps
     GFX_CMD_DRAW_BITMAP     = 0x40,
     GFX_CMD_DRAW_BITMAP_BG  = 0x41,
+    GFX_CMD_DRAW_BITMAP_FG  = 0x42,  // 1-bit, explicit foreground colour (0x40 carries none)
+    GFX_CMD_DRAW_RGB_BITMAP = 0x43,  // RGB565 pixels
+    GFX_CMD_DRAW_RGB_BITMAP_MASK = 0x44,  // 1-bit mask + RGB565 pixels
+    GFX_CMD_DRAW_GRAY_BITMAP = 0x45, // 8-bit gray pixels, shown as a gray ramp
 
     // Text
     GFX_CMD_SET_CURSOR        = 0x50,
@@ -113,6 +117,13 @@ struct GFX_PACKED GfxTrianglePayload     { int16_t x0; int16_t y0; int16_t x1; i
 // Bitmap payloads — bitmap bytes follow immediately after struct
 struct GFX_PACKED GfxBitmapPayload       { int16_t x; int16_t y; int16_t w; int16_t h; };
 struct GFX_PACKED GfxBitmapBgPayload     { int16_t x; int16_t y; int16_t w; int16_t h; uint16_t fg; uint16_t bg; };
+struct GFX_PACKED GfxBitmapFgPayload     { int16_t x; int16_t y; int16_t w; int16_t h; uint16_t fg; };
+// 0x43 / 0x44 / 0x45: header is x,y,w,h. Then, per opcode:
+//   0x43  w*h RGB565 pixels (u16 little-endian, row-major)
+//   0x44  1-bit mask ((w+7)/8*h bytes, rows padded, MSB first, 1 = draw) then w*h RGB565 pixels
+//   0x45  w*h 8-bit gray pixels
+// A frame whose payload is shorter than this, or with w<1 or h<1, must be ignored by the display.
+struct GFX_PACKED GfxImagePayload        { int16_t x; int16_t y; int16_t w; int16_t h; };
 
 struct GFX_PACKED GfxSetCursorPayload      { int16_t x; int16_t y; };
 struct GFX_PACKED GfxSetTextColorPayload   { uint16_t color; };

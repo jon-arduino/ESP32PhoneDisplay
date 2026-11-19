@@ -79,6 +79,24 @@ void ESP32PhoneDisplay::sendCommandWithTail(uint8_t cmd,
         _transport.send(reinterpret_cast<const uint8_t *>(tail), tailLen);
 }
 
+void ESP32PhoneDisplay::sendCommandWithTails(uint8_t cmd,
+                                             const void *fixed, uint16_t fixedLen,
+                                             const void *t1,    uint16_t l1,
+                                             const void *t2,    uint16_t l2)
+{
+    const uint32_t payloadLen = (uint32_t)fixedLen + l1 + l2;
+    if (payloadLen + 1 > 65535) return;                        // would not fit the 16-bit length field
+    uint8_t head[3 + 1 + 32];
+    if (fixedLen > 32) return;
+    head[0] = GFX_MAGIC;
+    putU16LE(&head[1], static_cast<uint16_t>(1 + payloadLen));
+    head[3] = cmd;
+    if (fixed && fixedLen) memcpy(&head[4], fixed, fixedLen);
+    _transport.send(head, static_cast<uint16_t>(4 + fixedLen));
+    if (t1 && l1) _transport.send(reinterpret_cast<const uint8_t *>(t1), l1);
+    if (t2 && l2) _transport.send(reinterpret_cast<const uint8_t *>(t2), l2);
+}
+
 // System
 void ESP32PhoneDisplay::begin(uint16_t w, uint16_t h)
 {
@@ -237,22 +255,114 @@ void ESP32PhoneDisplay::fillTriangle(int16_t x0, int16_t y0,
 }
 
 // Bitmaps
+// Large images are sent as horizontal strips so that no frame exceeds ~GFX_BITMAP_STRIP_BYTES of
+// pixel data (transports buffer a few KB, BLE writes are small). Each strip is a self-contained
+// command, so a partial image is never misinterpreted by the display.
+#ifndef GFX_BITMAP_STRIP_BYTES
+#define GFX_BITMAP_STRIP_BYTES 2048
+#endif
+
+static inline int stripRows(int bytesPerRow)
+{
+    int rows = GFX_BITMAP_STRIP_BYTES / (bytesPerRow > 0 ? bytesPerRow : 1);
+    return rows < 1 ? 1 : rows;
+}
+
 void ESP32PhoneDisplay::drawBitmap(int16_t x, int16_t y,
                                    const uint8_t *bitmap,
                                    int16_t w, int16_t h, Color color)
 {
-    GfxBitmapPayload p{x, y, w, h};
-    uint16_t nBytes = (uint16_t)(((int32_t)w * h + 7) / 8);
-    sendCommandWithTail(GFX_CMD_DRAW_BITMAP, &p, sizeof(p), bitmap, nBytes);
+    if (!bitmap || w <= 0 || h <= 0) return;
+    const int bw = (w + 7) / 8, rows = stripRows(bw);
+    for (int j = 0; j < h; j += rows) {
+        const int n = (h - j < rows) ? (h - j) : rows;
+#ifdef GFX_LEGACY_BITMAP
+        // older displays only know 0x40, which carries no colour: use the text colour instead
+        setTextColor(color);
+        GfxBitmapPayload p{x, (int16_t)(y + j), w, (int16_t)n};
+        sendCommandWithTail(GFX_CMD_DRAW_BITMAP, &p, sizeof(p), bitmap + (size_t)j * bw, (uint16_t)(n * bw));
+#else
+        GfxBitmapFgPayload p{x, (int16_t)(y + j), w, (int16_t)n, color};
+        sendCommandWithTail(GFX_CMD_DRAW_BITMAP_FG, &p, sizeof(p), bitmap + (size_t)j * bw, (uint16_t)(n * bw));
+#endif
+    }
 }
 
 void ESP32PhoneDisplay::drawBitmap(int16_t x, int16_t y,
                                    const uint8_t *bitmap,
                                    int16_t w, int16_t h, Color fg, Color bg)
 {
-    GfxBitmapBgPayload p{x, y, w, h, fg, bg};
-    uint16_t nBytes = (uint16_t)(((int32_t)w * h + 7) / 8);
-    sendCommandWithTail(GFX_CMD_DRAW_BITMAP_BG, &p, sizeof(p), bitmap, nBytes);
+    if (!bitmap || w <= 0 || h <= 0) return;
+    const int bw = (w + 7) / 8, rows = stripRows(bw);     // rows are padded to whole bytes, like Adafruit_GFX
+    for (int j = 0; j < h; j += rows) {
+        const int n = (h - j < rows) ? (h - j) : rows;
+        GfxBitmapBgPayload p{x, (int16_t)(y + j), w, (int16_t)n, fg, bg};
+        sendCommandWithTail(GFX_CMD_DRAW_BITMAP_BG, &p, sizeof(p), bitmap + (size_t)j * bw, (uint16_t)(n * bw));
+    }
+}
+
+void ESP32PhoneDisplay::drawXBitmap(int16_t x, int16_t y,
+                                    const uint8_t *bitmap,
+                                    int16_t w, int16_t h, Color color)
+{
+    if (!bitmap || w <= 0 || h <= 0) return;
+    const int bw = (w + 7) / 8, rows = stripRows(bw);
+    uint8_t *tmp = (uint8_t *)malloc((size_t)bw * rows);
+    if (!tmp) return;
+    for (int j = 0; j < h; j += rows) {
+        const int n = (h - j < rows) ? (h - j) : rows;
+        for (int k = 0; k < bw * n; k++) {                // X11 is LSB-first; the wire format is MSB-first
+            uint8_t b = bitmap[(size_t)j * bw + k], r = 0;
+            for (int i = 0; i < 8; i++) if (b & (1 << i)) r |= 0x80 >> i;
+            tmp[k] = r;
+        }
+        GfxBitmapFgPayload p{x, (int16_t)(y + j), w, (int16_t)n, color};
+        sendCommandWithTail(GFX_CMD_DRAW_BITMAP_FG, &p, sizeof(p), tmp, (uint16_t)(n * bw));
+    }
+    free(tmp);
+}
+
+void ESP32PhoneDisplay::drawRGBBitmap(int16_t x, int16_t y,
+                                      const uint16_t *bitmap, int16_t w, int16_t h)
+{
+    if (!bitmap || w <= 0 || h <= 0 || 2 * (int32_t)w + 9 > 65535) return;
+    const int rows = stripRows(2 * w);
+    for (int j = 0; j < h; j += rows) {
+        const int n = (h - j < rows) ? (h - j) : rows;
+        GfxImagePayload p{x, (int16_t)(y + j), w, (int16_t)n};
+        // ESP32 is little-endian, so the pixel array is already in wire order
+        sendCommandWithTail(GFX_CMD_DRAW_RGB_BITMAP, &p, sizeof(p), bitmap + (size_t)j * w, (uint16_t)(2 * n * w));
+    }
+}
+
+void ESP32PhoneDisplay::drawRGBBitmap(int16_t x, int16_t y,
+                                      const uint16_t *bitmap, const uint8_t *mask,
+                                      int16_t w, int16_t h)
+{
+    if (!mask) { drawRGBBitmap(x, y, bitmap, w, h); return; }
+    if (!bitmap || w <= 0 || h <= 0) return;
+    const int bw = (w + 7) / 8;
+    if (bw + 2 * (int32_t)w + 9 > 65535) return;
+    const int rows = stripRows(bw + 2 * w);
+    for (int j = 0; j < h; j += rows) {
+        const int n = (h - j < rows) ? (h - j) : rows;
+        GfxImagePayload p{x, (int16_t)(y + j), w, (int16_t)n};
+        sendCommandWithTails(GFX_CMD_DRAW_RGB_BITMAP_MASK, &p, sizeof(p),
+                             mask + (size_t)j * bw, (uint16_t)(n * bw),
+                             bitmap + (size_t)j * w, (uint16_t)(2 * n * w));
+    }
+}
+
+void ESP32PhoneDisplay::drawGrayscaleBitmap(int16_t x, int16_t y,
+                                            const uint8_t *bitmap, int16_t w, int16_t h)
+{
+    if (!bitmap || w <= 0 || h <= 0 || (int32_t)w + 9 > 65535) return;
+    const int rows = stripRows(w);
+    for (int j = 0; j < h; j += rows) {
+        const int n = (h - j < rows) ? (h - j) : rows;
+        GfxImagePayload p{x, (int16_t)(y + j), w, (int16_t)n};
+        sendCommandWithTail(GFX_CMD_DRAW_GRAY_BITMAP, &p, sizeof(p), bitmap + (size_t)j * w, (uint16_t)(n * w));
+    }
 }
 
 // Text
