@@ -47,36 +47,14 @@ void ESP32PhoneDisplay::sendCommand(uint8_t cmd, const void *payload, uint16_t p
     }
 }
 
+// A frame that arrives in several send() calls is not atomic: a transport's background task
+// (WiFi ping, auto-flush) can slip its own bytes between the pieces and corrupt the stream.
+// So the header and tails are gathered into ONE buffer and handed over in ONE send().
 void ESP32PhoneDisplay::sendCommandWithTail(uint8_t cmd,
                                             const void *fixed, uint16_t fixedLen,
                                             const void *tail,  uint16_t tailLen)
 {
-    const uint16_t payloadLen = static_cast<uint16_t>(fixedLen + tailLen);
-    const uint16_t len        = static_cast<uint16_t>(1 + payloadLen);
-    const uint16_t headTotal  = static_cast<uint16_t>(3 + 1 + fixedLen);
-
-    if (headTotal <= 256) {
-        uint8_t head[256];
-        head[0] = GFX_MAGIC;
-        putU16LE(&head[1], len);
-        head[3] = cmd;
-        if (fixed && fixedLen)
-            memcpy(&head[4], fixed, fixedLen);
-        _transport.send(head, headTotal);
-    } else {
-        uint8_t *head = (uint8_t *)malloc(headTotal);
-        if (!head) return;
-        head[0] = GFX_MAGIC;
-        putU16LE(&head[1], len);
-        head[3] = cmd;
-        if (fixed && fixedLen)
-            memcpy(&head[4], fixed, fixedLen);
-        _transport.send(head, headTotal);
-        free(head);
-    }
-
-    if (tail && tailLen)
-        _transport.send(reinterpret_cast<const uint8_t *>(tail), tailLen);
+    sendCommandWithTails(cmd, fixed, fixedLen, tail, tailLen, nullptr, 0);
 }
 
 void ESP32PhoneDisplay::sendCommandWithTails(uint8_t cmd,
@@ -85,16 +63,20 @@ void ESP32PhoneDisplay::sendCommandWithTails(uint8_t cmd,
                                              const void *t2,    uint16_t l2)
 {
     const uint32_t payloadLen = (uint32_t)fixedLen + l1 + l2;
-    if (payloadLen + 1 > 65535) return;                        // would not fit the 16-bit length field
-    uint8_t head[3 + 1 + 32];
-    if (fixedLen > 32) return;
-    head[0] = GFX_MAGIC;
-    putU16LE(&head[1], static_cast<uint16_t>(1 + payloadLen));
-    head[3] = cmd;
-    if (fixed && fixedLen) memcpy(&head[4], fixed, fixedLen);
-    _transport.send(head, static_cast<uint16_t>(4 + fixedLen));
-    if (t1 && l1) _transport.send(reinterpret_cast<const uint8_t *>(t1), l1);
-    if (t2 && l2) _transport.send(reinterpret_cast<const uint8_t *>(t2), l2);
+    const uint32_t total      = 4 + payloadLen;               // magic + len(2) + cmd + payload
+    if (total > 65535) return;                                // would not fit the 16-bit length field
+
+    uint8_t *buf = (uint8_t *)malloc(total);
+    if (!buf) return;
+    buf[0] = GFX_MAGIC;
+    putU16LE(&buf[1], static_cast<uint16_t>(1 + payloadLen));
+    buf[3] = cmd;
+    size_t o = 4;
+    if (fixed && fixedLen) { memcpy(buf + o, fixed, fixedLen); o += fixedLen; }
+    if (t1 && l1)          { memcpy(buf + o, t1, l1);          o += l1; }
+    if (t2 && l2)          { memcpy(buf + o, t2, l2);          o += l2; }
+    _transport.send(buf, static_cast<uint16_t>(o));
+    free(buf);
 }
 
 // System
